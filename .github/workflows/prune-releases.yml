@@ -1,0 +1,35 @@
+name: Prune Old Releases
+
+# Runs after each successful Release workflow and deletes all but the 5
+# most recent releases (and their git tags).
+#
+# Uses workflow_run for the same reason as attach-checksum.yml — cargo-dist
+# creates releases with GITHUB_TOKEN, so release:published never fires.
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+
+jobs:
+  prune:
+    # Only run on successful tag-based releases; skip PR runs
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      startsWith(github.event.workflow_run.head_branch, 'v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Delete releases beyond the 5 most recent
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh release list --repo "$REPO" --limit 100 --json tagName \
+            --jq '.[5:][].tagName' \
+          | xargs -r -I{} gh release delete {} \
+              --repo "$REPO" \
+              --yes \
+              --cleanup-tag

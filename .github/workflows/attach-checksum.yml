@@ -1,0 +1,47 @@
+name: Attach Checksum to Release
+
+# Fires when the Release workflow (cargo-dist) completes successfully.
+#
+# We use workflow_run instead of "release: published" because GitHub does NOT
+# chain workflow events that are triggered by GITHUB_TOKEN.  cargo-dist creates
+# the GitHub release with GITHUB_TOKEN, so a "release: published" listener
+# never fires.  workflow_run is not subject to this restriction.
+#
+# gcloud-switch self-update fetches and verifies this sidecar before
+# executing the installer — if the file is absent, self-update aborts.
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+
+jobs:
+  attach-checksum:
+    # Only run on successful tag-based releases; skip PR runs of the Release workflow
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      startsWith(github.event.workflow_run.head_branch, 'v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download installer from release
+        run: |
+          gh release download "${{ github.event.workflow_run.head_branch }}" \
+            --pattern "gcloud-switch-installer.sh" \
+            --repo "${{ github.repository }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate SHA-256 sidecar
+        run: sha256sum gcloud-switch-installer.sh > gcloud-switch-installer.sh.sha256
+
+      - name: Upload sidecar to release
+        run: |
+          gh release upload "${{ github.event.workflow_run.head_branch }}" \
+            gcloud-switch-installer.sh.sha256 \
+            --clobber \
+            --repo "${{ github.repository }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

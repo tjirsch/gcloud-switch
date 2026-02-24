@@ -127,11 +127,56 @@ gcloud-switch self-update --check-only
 # Skip downloading README after install, or skip opening it
 gcloud-switch self-update --no-download-readme
 gcloud-switch self-update --no-download-readme --no-open-readme
+
+# Download and open the latest README
+gcloud-switch open-readme
+
+# Generate shell completion script
+gcloud-switch completion bash >> ~/.bash_completion
+gcloud-switch completion zsh --install    # installs to ~/.zsh/completions/_gcloud-switch
+
+# Set preferred editor for opening files
+gcloud-switch set-preferred-editor code
+gcloud-switch set-preferred-editor --clear   # revert to $EDITOR / OS default
+gcloud-switch set-preferred-editor           # show current setting
 ```
 
 **Self-update options:** `--no-download-readme`, `--no-open-readme`, `--check-only`. The program can also check for updates automatically when you run other commands; this is controlled by the [configuration file](#configuration-configgcloud-switchgcloud-switchtoml) `~/.config/gcloud-switch/gcloud-switch.toml` (`self_update_frequency`: `never`, `always`, or `daily`).
 
-`self-update` compares the current version with the latest GitHub release; if an update is available it downloads and runs the installer script, then optionally downloads the README to your Downloads folder and opens it.
+`self-update` compares the current version with the latest GitHub release; if an update is available it downloads and runs the installer script, then optionally downloads the README to your Downloads folder and opens it. The editor used to open the README follows the priority: `preferred_editor` config → `$EDITOR` env var → OS default app.
+
+### Shell Completion
+
+Generate tab-completion for your shell (`bash`, `zsh`, `fish`, `powershell`):
+
+```sh
+# Print to stdout
+gcloud-switch completion bash
+gcloud-switch completion zsh
+
+# Auto-install to the canonical shell location
+gcloud-switch completion zsh --install
+# → installs to ~/.zsh/completions/_gcloud-switch
+# → prints fpath setup instructions
+
+gcloud-switch completion fish --install
+# → installs to ~/.config/fish/completions/gcloud-switch.fish
+```
+
+**Install locations for `--install`:**
+
+| Shell | Path |
+|-------|------|
+| bash | `~/.local/share/bash-completion/completions/gcloud-switch` |
+| zsh | `~/.zsh/completions/_gcloud-switch` |
+| fish | `~/.config/fish/completions/gcloud-switch.fish` |
+| powershell | `%USERPROFILE%\Documents\PowerShell\Completions\gcloud-switch.ps1` |
+
+For zsh, add this to `~/.zshrc` if not already present:
+```zsh
+fpath=(~/.zsh/completions $fpath)
+autoload -Uz compinit && compinit
+```
 
 ### Sync profiles via Git (optional)
 
@@ -158,11 +203,21 @@ Merge is done profile-by-profile using an `updated_at` timestamp: the newer vers
 
 ## Configuration (~/.config/gcloud-switch/gcloud-switch.toml)
 
-User-level **parameters** (e.g. when to check for updates) live in **`~/.config/gcloud-switch/gcloud-switch.toml`**. This file is **created on first run** with default values (e.g. `self_update_frequency = "always"`). The folder `~/.config/gcloud-switch/` may already exist (e.g. installer leaves `gcloud-switch-receipt.json` there); the program creates it if needed and writes `gcloud-switch.toml` there.
+User-level **parameters** (e.g. when to check for updates, preferred editor) live in **`~/.config/gcloud-switch/gcloud-switch.toml`**. This file is **created on first run** with default values (e.g. `self_update_frequency = "always"`). The folder `~/.config/gcloud-switch/` may already exist (e.g. installer leaves `gcloud-switch-receipt.json` there); the program creates it if needed and writes `gcloud-switch.toml` there.
+
+Example:
+
+```toml
+self_update_frequency = "daily"
+preferred_editor = "zed"
+```
+
+Use `gcloud-switch set-preferred-editor <editor>` to set the editor from the command line.
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `self_update_frequency` | `"always"` | When to check for updates on normal runs: `never`, `always`, or `daily` (at most once per 24 hours). The check is check-only (no install, no README). |
+| `preferred_editor` | *(none)* | Editor command used to open files (e.g. `"zed"`, `"code"`, `"vim"`). Falls back to `$EDITOR` env var, then the OS default app. |
 
 **Profile data** stays in **`profiles.toml`** under `~/.config/gcloud/gcloud-switch/` (see [File Locations](#file-locations)); it is not stored in `~/.config/gcloud-switch/`.
 
@@ -208,7 +263,7 @@ You can also manually trigger re-auth with the `a` key.
 
 | Path | Description |
 |------|-------------|
-| `~/.config/gcloud-switch/gcloud-switch.toml` | User parameters (e.g. `self_update_frequency`). Created on first run with defaults. |
+| `~/.config/gcloud-switch/gcloud-switch.toml` | User parameters (`self_update_frequency`, `preferred_editor`). Created on first run with defaults. |
 | `~/.config/gcloud/gcloud-switch/profiles.toml` | Profile definitions |
 | `~/.config/gcloud/gcloud-switch/sync-config.toml` | Optional Git sync config (remote URL, branch) |
 | `~/.config/gcloud/gcloud-switch/sync-repo/` | Git clone used for sync (profiles.toml only) |

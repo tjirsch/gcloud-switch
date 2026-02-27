@@ -134,6 +134,7 @@ gcloud-switch open-readme
 # Generate shell completion script
 gcloud-switch completion bash >> ~/.bash_completion
 gcloud-switch completion zsh --install    # installs to ~/.zsh/completions/_gcloud-switch
+gcloud-switch completion                  # macOS: defaults to zsh --install
 
 # Set editor for opening files
 gcloud-switch set-editor code
@@ -162,6 +163,8 @@ gcloud-switch completion zsh --install
 gcloud-switch completion fish --install
 # → installs to ~/.config/fish/completions/gcloud-switch.fish
 ```
+
+On macOS, running `gcloud-switch completion` without arguments defaults to `zsh --install`.
 
 **Install locations for `--install`:**
 

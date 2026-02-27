@@ -81,9 +81,9 @@ enum Commands {
     OpenReadme,
     /// Generate shell completion script
     Completion {
-        /// Shell to generate completions for: bash, zsh, fish, powershell
-        shell: String,
-        /// Install the completion script to the default location for the shell
+        /// Shell to generate completions for: bash, zsh, fish, powershell (default: zsh on macOS)
+        shell: Option<String>,
+        /// Install the completion script to the default location for the shell (default: true on macOS when no shell is specified)
         #[arg(long)]
         install: bool,
     },
@@ -343,6 +343,12 @@ fn main() -> Result<()> {
             run_open_readme(global_settings.editor.as_deref())?;
         }
         Some(Commands::Completion { shell, install }) => {
+            let using_default = shell.is_none();
+            #[cfg(target_os = "macos")]
+            let shell = shell.unwrap_or_else(|| "zsh".to_string());
+            #[cfg(not(target_os = "macos"))]
+            let shell = shell.ok_or_else(|| anyhow::anyhow!("Shell argument is required"))?;
+            let install = install || (using_default && cfg!(target_os = "macos"));
             run_completion(&shell, install)?;
         }
         Some(Commands::SetEditor { editor, clear }) => {

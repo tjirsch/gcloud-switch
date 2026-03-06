@@ -95,6 +95,10 @@ enum Commands {
         #[arg(long)]
         clear: bool,
     },
+    /// Print the global config file (gcloud-switch.toml)
+    ShowConfig,
+    /// Open the global config file in an editor
+    EditConfig,
 }
 
 #[derive(Subcommand)]
@@ -260,7 +264,7 @@ fn main() -> Result<()> {
     // Load/create global settings on first run (creates ~/.config/gcloud-switch/gcloud-switch.toml with defaults)
     let mut global_settings = load_global_settings();
     // Optional: check for updates per global settings
-    if !matches!(cli.command, Some(Commands::SelfUpdate { .. }) | Some(Commands::OpenReadme) | Some(Commands::Completion { .. }) | Some(Commands::SetEditor { .. })) {
+    if !matches!(cli.command, Some(Commands::SelfUpdate { .. }) | Some(Commands::OpenReadme) | Some(Commands::Completion { .. }) | Some(Commands::SetEditor { .. }) | Some(Commands::ShowConfig) | Some(Commands::EditConfig)) {
         let _ = maybe_check_for_updates(&mut global_settings);
     }
 
@@ -366,6 +370,24 @@ fn main() -> Result<()> {
                     None => println!("editor is not set (using $EDITOR / OS default)."),
                 }
             }
+        }
+        Some(Commands::ShowConfig) => {
+            let path = global_settings_path().context("Could not determine config directory")?;
+            if path.exists() {
+                let content = std::fs::read_to_string(&path)
+                    .with_context(|| format!("Failed to read {}", path.display()))?;
+                print!("{}", content);
+            } else {
+                println!("Config file does not exist yet: {}", path.display());
+            }
+        }
+        Some(Commands::EditConfig) => {
+            let path = global_settings_path().context("Could not determine config directory")?;
+            if !path.exists() {
+                // Ensure the file exists before opening
+                save_global_settings(&global_settings)?;
+            }
+            open_file(&path, global_settings.editor.as_deref())?;
         }
         Some(Commands::Sync { sub }) => {
             let store = Store::new()?;

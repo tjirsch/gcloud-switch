@@ -103,38 +103,50 @@ pub fn activate_user(profile_name: &str, account: &str, project: &str) -> Result
         .status();
 
     // Activate the configuration
-    let status = Command::new("gcloud")
+    let output = Command::new("gcloud")
         .args(["config", "configurations", "activate", profile_name])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+        .output()
         .context("Failed to activate gcloud configuration")?;
-    if !status.success() {
-        anyhow::bail!("gcloud config configurations activate failed for '{}'", profile_name);
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "gcloud config configurations activate failed for '{}': {}",
+            profile_name,
+            stderr.trim()
+        );
     }
 
     // Set account and project on the active configuration
     if !account.is_empty() {
-        let status = Command::new("gcloud")
+        let output = Command::new("gcloud")
             .args(["config", "set", "account", account])
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
+            .output()
             .context("Failed to set gcloud account")?;
-        if !status.success() {
-            anyhow::bail!("gcloud config set account failed");
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "gcloud config set account failed for '{}': {}",
+                account,
+                stderr.trim()
+            );
         }
     }
 
     if !project.is_empty() {
-        let status = Command::new("gcloud")
+        let output = Command::new("gcloud")
             .args(["config", "set", "project", project])
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
+            .output()
             .context("Failed to set gcloud project")?;
-        if !status.success() {
-            anyhow::bail!("gcloud config set project failed");
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "gcloud config set project failed for '{}': {}",
+                project,
+                stderr.trim()
+            );
         }
     }
 

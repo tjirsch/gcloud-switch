@@ -322,7 +322,18 @@ fn main() -> Result<()> {
             let profile = data
                 .profiles
                 .get(&name)
-                .ok_or_else(|| anyhow::anyhow!("Profile '{}' not found", name))?;
+                .ok_or_else(|| anyhow::anyhow!("Profile '{}' not found", name))?
+                .clone();
+
+            // Check auth before activation (matches TUI behavior)
+            if !gcloud::check_account_auth(&profile.user_account) {
+                println!(
+                    "Credentials expired for '{}'. Re-authenticating...",
+                    profile.user_account
+                );
+                gcloud::reauth_user(&profile.user_account)?;
+            }
+
             gcloud::activate_both(&store, &name, &profile.user_account, &profile.user_project)?;
             data.active_profile = Some(name.clone());
             store.save_profiles(&data)?;

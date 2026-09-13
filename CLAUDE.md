@@ -10,11 +10,12 @@ cargo build --release    # release build
 cargo run                # build and run the TUI
 cargo run -- list        # run a specific subcommand
 cargo check              # quick type-check
+cargo test               # unit tests
 cargo clippy             # lint
 cargo fmt                # format
 ```
 
-No test suite exists yet. Verify changes by building (`cargo build`) and manually testing the relevant command.
+Unit tests live in `#[cfg(test)]` modules beside the code they cover (`src/ui.rs`: the table column geometry that places the edit cursor and the suggestion dropdown); `cargo test` runs them. Everything without a test — most of the TUI and all gcloud interaction — is verified by building (`cargo build`) and running the relevant command.
 
 ## Architecture
 

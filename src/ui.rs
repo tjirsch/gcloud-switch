@@ -1,5 +1,5 @@
 use ratatui::{
-    layout::{Constraint, Layout, Rect},
+    layout::{Constraint, Flex, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
@@ -10,7 +10,74 @@ use ratatui::{
 };
 
 use crate::app::{App, Column, InputMode};
-use crate::profile::SyncMode;
+use crate::profile::{Profile, SyncMode};
+
+/// The two-line header labels, one pair per column.
+const HEADER_LABELS: [(&str, &str); 3] = [
+    ("Profile", ""),
+    ("User Account", "Project"),
+    ("ADC Account", "Quota Project"),
+];
+
+/// Display width of the auth-status suffix rendered after an account value in normal mode:
+/// a space and a two-cell emoji (" \u{1F511}" / " \u{1F512}").
+const LOCK_GLYPH_WIDTH: usize = 3;
+
+/// Cells added to the table's content width so the whole-percent truncation in
+/// `Constraint::Percentage` cannot clip the widest cell.
+const TABLE_WIDTH_SLACK: usize = 4;
+
+/// Content width of each column in cells: the widest of the two header lines and of every
+/// profile row. Account columns include the lock glyph, which is part of the rendered cell.
+/// Values are ASCII (enforced on input), so `len()` is the display width.
+fn column_content_widths(profile_names: &[String], profiles: &[Profile]) -> [usize; 3] {
+    let mut col_max = [0usize; 3];
+    for (i, (line1, line2)) in HEADER_LABELS.iter().enumerate() {
+        col_max[i] = line1.len().max(line2.len());
+    }
+    for (name, profile) in profile_names.iter().zip(profiles) {
+        col_max[0] = col_max[0].max(name.len());
+        col_max[1] = col_max[1]
+            .max(profile.user_account.len() + LOCK_GLYPH_WIDTH)
+            .max(profile.user_project.len());
+        col_max[2] = col_max[2]
+            .max(profile.adc_account.len() + LOCK_GLYPH_WIDTH)
+            .max(profile.adc_quota_project.len());
+    }
+    col_max
+}
+
+/// The width constraints handed to `Table::new`. `column_rects` must receive this same array.
+fn column_constraints(col_max: [usize; 3]) -> [Constraint; 3] {
+    let total = col_max.iter().sum::<usize>().max(1);
+    // w <= total, so w * 100 / total is at most 100 and fits in u16 after the division.
+    col_max.map(|w| Constraint::Percentage((w * 100 / total).max(1) as u16))
+}
+
+/// The column rectangles exactly as `Table` lays them out inside `area`.
+///
+/// Mirrors `Table::get_column_widths` (ratatui-widgets 0.3.0): the constraints are solved on a
+/// zero-origin rect of the table's width with the table's flex and column spacing, and every
+/// cell is drawn at `area.x + x`. The table reserves a selection column of the highlight
+/// symbol's width first; this app sets no highlight symbol, so that column is zero wide.
+/// Anything the cursor or an overlay positions inside the table goes through here: a second
+/// derivation of the same geometry is where the cursor drifts by a cell.
+fn column_rects(area: Rect, widths: [Constraint; 3]) -> [Rect; 3] {
+    let cols: [Rect; 3] = Layout::horizontal(widths)
+        .flex(Flex::Start)
+        .spacing(0u16)
+        .areas(Rect::new(0, 0, area.width, 1));
+    cols.map(|c| Rect::new(area.x + c.x, area.y, c.width, area.height))
+}
+
+/// Index into `column_rects` of the column whose cell is being edited.
+fn edit_column_index(col: Column) -> usize {
+    match col {
+        Column::Adc => 2,
+        // `Both` is mapped to `User` before edit mode is entered (the `e` key in `app.rs`).
+        Column::User | Column::Both => 1,
+    }
+}
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let frame_area = frame.area();
@@ -70,25 +137,10 @@ fn table_content_width(app: &App) -> usize {
     if app.profile_names.is_empty() {
         return 36;
     }
-    let header_labels: [(&str, &str); 3] = [
-        ("Profile", ""),
-        ("User Account", "Project"),
-        ("ADC Account", "Quota Project"),
-    ];
-    let mut col_max = [0usize; 3];
-    for (i, (line1, line2)) in header_labels.iter().enumerate() {
-        col_max[i] = col_max[i].max(line1.len()).max(line2.len());
-    }
-    for (name, profile) in app.profile_names.iter().zip(app.profiles.iter()) {
-        col_max[0] = col_max[0].max(name.len());
-        col_max[1] = col_max[1]
-            .max(profile.user_account.len() + 3)
-            .max(profile.user_project.len());
-        col_max[2] = col_max[2]
-            .max(profile.adc_account.len() + 3)
-            .max(profile.adc_quota_project.len());
-    }
-    col_max.iter().sum::<usize>() + 4
+    column_content_widths(&app.profile_names, &app.profiles)
+        .iter()
+        .sum::<usize>()
+        + TABLE_WIDTH_SLACK
 }
 
 fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -99,12 +151,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let header_labels: [(&str, &str); 3] = [
-        ("Profile", ""),
-        ("User Account", "Project"),
-        ("ADC Account", "Quota Project"),
-    ];
-    let header_cells = header_labels.iter().map(|(line1, line2)| {
+    let header_cells = HEADER_LABELS.iter().map(|(line1, line2)| {
         let style = Style::default()
             .fg(Color::Black)
             .add_modifier(Modifier::BOLD);
@@ -190,27 +237,8 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
             .height(2).style(base_style)
         });
 
-    // Calculate max content width per column
-    let mut col_max = [0usize; 3];
-    // Header widths
-    for (i, (line1, line2)) in header_labels.iter().enumerate() {
-        col_max[i] = col_max[i].max(line1.len()).max(line2.len());
-    }
-    // Data widths
-    for (name, profile) in app.profile_names.iter().zip(app.profiles.iter()) {
-        let profile_w = name.len();
-        col_max[0] = col_max[0].max(profile_w);
-        col_max[1] = col_max[1]
-            .max(profile.user_account.len())
-            .max(profile.user_project.len());
-        col_max[2] = col_max[2]
-            .max(profile.adc_account.len())
-            .max(profile.adc_quota_project.len());
-    }
-    let total: usize = col_max.iter().sum::<usize>().max(1);
-    let widths = col_max.map(|w| {
-        Constraint::Percentage((w as u16 * 100 / total as u16).max(1))
-    });
+    // The same `widths` lay the table out and, below, place the cursor: one geometry.
+    let widths = column_constraints(column_content_widths(&app.profile_names, &app.profiles));
 
     let table = Table::new(rows, widths)
         .header(header)
@@ -239,20 +267,9 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
 
     // Position the terminal cursor for blinking edit cursor
     if matches!(app.input_mode, InputMode::EditAccount | InputMode::EditProject) {
-        let inner_w = area.width as usize;
-        // Compute actual column widths (matching the percentage constraints)
-        let col_px: Vec<usize> = col_max
-            .iter()
-            .map(|w| (w * inner_w / total).max(1))
-            .collect();
-
-        let col_offset: usize = match app.edit_col {
-            Column::User => col_px[0],
-            Column::Adc  => col_px[0] + col_px[1],
-            Column::Both => col_px[0],
-        };
-
-        let cursor_x = area.x + col_offset as u16 + app.edit_cursor_pos as u16;
+        let col = column_rects(area, widths)[edit_column_index(app.edit_col)];
+        // Keep the caret inside its column when the buffer is wider than the clipped cell.
+        let cursor_x = col.x + (app.edit_cursor_pos as u16).min(col.width.saturating_sub(1));
         let scroll_offset = app.table_state.offset();
         let cursor_y = area.y
             + 2  // header height
@@ -307,7 +324,7 @@ fn help_key(key: &str, desc: &str) -> Vec<Span<'static>> {
             key.to_string(),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!("{}", desc), Style::default().fg(Color::DarkGray)),
+        Span::styled(desc.to_string(), Style::default().fg(Color::DarkGray)),
     ]
 }
 
@@ -389,43 +406,9 @@ fn draw_suggestions(frame: &mut Frame, app: &App, table_area: Rect) {
 
     let selected_idx = app.suggestion_index.unwrap_or(0);
 
-    // Replicate column width calculation to find dropdown x position
-    let header_labels: [(&str, &str); 3] = [
-        ("Profile", ""),
-        ("User Account", "Project"),
-        ("ADC Account", "Quota Project"),
-    ];
-    let mut col_max = [0usize; 3];
-    for (i, (line1, line2)) in header_labels.iter().enumerate() {
-        col_max[i] = col_max[i].max(line1.len()).max(line2.len());
-    }
-    for (name, profile) in app.profile_names.iter().zip(app.profiles.iter()) {
-        let profile_w = name.len() + 4;
-        col_max[0] = col_max[0].max(profile_w);
-        col_max[1] = col_max[1]
-            .max(profile.user_account.len())
-            .max(profile.user_project.len());
-        col_max[2] = col_max[2]
-            .max(profile.adc_account.len())
-            .max(profile.adc_quota_project.len());
-    }
-    let total: usize = col_max.iter().sum::<usize>().max(1);
-
-    let inner_x = table_area.x;
-    let inner_w = table_area.width;
-
-    // Column pixel widths (proportional)
-    let col_widths: Vec<u16> = col_max
-        .iter()
-        .map(|w| ((*w as u16) * inner_w / total as u16).max(1))
-        .collect();
-
-    // X position based on which column is being edited
-    let dropdown_x = match app.edit_col {
-        Column::User => inner_x + col_widths[0],
-        Column::Adc => inner_x + col_widths[0] + col_widths[1],
-        Column::Both => inner_x + col_widths[0],
-    };
+    // The dropdown opens at the left edge of the edited column, where the table draws it.
+    let widths = column_constraints(column_content_widths(&app.profile_names, &app.profiles));
+    let dropdown_x = column_rects(table_area, widths)[edit_column_index(app.edit_col)].x;
 
     // Y position: header (2) + rows above * 2 + current row offset
     let row_y_offset = if app.input_mode == InputMode::EditAccount {
@@ -443,7 +426,7 @@ fn draw_suggestions(frame: &mut Frame, app: &App, table_area: Rect) {
         .map(|s| s.len())
         .max()
         .unwrap_or(20) as u16;
-    let dropdown_w = (max_item_width + 4).min(50).max(20);
+    let dropdown_w = (max_item_width + 4).clamp(20, 50);
     let dropdown_h = (app.suggestions.len() as u16 + 2).min(12); // +2 for borders
 
     // Clamp to screen bounds
@@ -499,5 +482,93 @@ fn draw_suggestions(frame: &mut Frame, app: &App, table_area: Rect) {
             dropdown_area.inner(ratatui::layout::Margin { horizontal: 0, vertical: 1 }),
             &mut scrollbar_state,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::buffer::Buffer;
+    use ratatui::widgets::{StatefulWidget, TableState};
+
+    /// Content shapes whose `w * 100 / total` residues differ, so the whole-percent
+    /// truncation lands on different cells.
+    const SHAPES: [[usize; 3]; 3] = [
+        [10, 23, 23], // the reported case: 17/41/41 %
+        [7, 26, 26],  // header-bound profile column: 11/44/44 %
+        [30, 12, 45], // profile column widest: 34/13/51 %
+    ];
+
+    /// Renders a real `Table` with the constraints `column_rects` receives and checks that
+    /// the first character of every column lands at `rects[i].x`: for every table width
+    /// from 30 to 220 cells, with and without an x offset, with a row selected.
+    ///
+    /// The reported defect: at 108 cells the table starts the User column at 18 while the
+    /// former `w * width / total` put the cursor at 19.
+    #[test]
+    fn column_rects_match_where_the_table_draws() {
+        const MARKERS: [&str; 3] = ["A", "B", "C"];
+        for shape in SHAPES {
+            for width in 30..=220u16 {
+                for x in [0u16, 7] {
+                    let area = Rect::new(x, 3, width, 6); // header (2) + two rows of 2
+                    let widths = column_constraints(shape);
+                    let rects = column_rects(area, widths);
+
+                    let header = Row::new(
+                        HEADER_LABELS.map(|(line1, line2)| Cell::from(format!("{line1}\n{line2}"))),
+                    )
+                    .height(2);
+                    let rows = [
+                        Row::new(MARKERS.map(Cell::from)).height(2),
+                        Row::new(MARKERS.map(Cell::from)).height(2),
+                    ];
+                    let table = Table::new(rows, widths).header(header).column_spacing(0);
+                    let mut state = TableState::default().with_selected(Some(0));
+                    let mut buf = Buffer::empty(area);
+                    StatefulWidget::render(table, area, &mut buf, &mut state);
+
+                    let y = area.y + 2; // first data row, directly below the two-line header
+                    for (i, (rect, marker)) in rects.iter().zip(MARKERS).enumerate() {
+                        let drawn_at: Vec<u16> = (area.left()..area.right())
+                            .filter(|&cx| buf[(cx, y)].symbol() == marker)
+                            .collect();
+                        let expected: Vec<u16> = if rect.width == 0 { vec![] } else { vec![rect.x] };
+                        assert_eq!(
+                            drawn_at, expected,
+                            "shape {shape:?}, width {width}, x {x}: column {i} drawn at {drawn_at:?}, column_rects says {rect:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn column_constraints_stay_within_one_to_one_hundred_percent() {
+        for shape in [[700usize, 700, 700], [1, 65_535, 65_535], [0, 0, 0]] {
+            for constraint in column_constraints(shape) {
+                match constraint {
+                    Constraint::Percentage(p) => {
+                        assert!((1..=100).contains(&p), "{shape:?} -> {constraint:?}");
+                    }
+                    other => panic!("{shape:?}: expected Percentage, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn column_content_widths_cover_headers_and_the_lock_glyph() {
+        let names = vec!["p".to_string()];
+        let profiles = vec![Profile {
+            user_account: "a@b.c".into(),
+            user_project: "x".into(),
+            adc_account: "longer.name@example.com".into(),
+            adc_quota_project: "q".into(),
+            updated_at: None,
+        }];
+        // Profile and User columns are header-bound; ADC is bound by the account plus glyph.
+        assert_eq!(column_content_widths(&names, &profiles), [7, 12, 23 + LOCK_GLYPH_WIDTH]);
     }
 }

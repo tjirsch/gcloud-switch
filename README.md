@@ -331,6 +331,7 @@ cargo build                # Debug build
 cargo build --release      # Release build
 cargo run                  # Build and run the TUI
 cargo check                # Quick type-check without building
+cargo test                 # Run unit tests
 cargo clippy               # Lint
 cargo fmt                  # Format code
 ```

@@ -1,4 +1,6 @@
 /target
+# the rendered documentation site (built by scripts/build-site.py, published by CI)
+_site/
 .DS_Store
 .claude
 .windsurf

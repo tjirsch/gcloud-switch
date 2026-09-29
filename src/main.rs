@@ -6,11 +6,11 @@ mod sync;
 mod ui;
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::builder::NonEmptyStringValueParser;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
@@ -29,6 +29,10 @@ use crate::store::Store;
 pub struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+    /// Open the documentation site in the browser at this command's section
+    /// (`gcloud-switch activate --html-help`); alone, the front page
+    #[arg(long, global = true)]
+    html_help: bool,
 }
 
 #[derive(Subcommand)]
@@ -78,13 +82,10 @@ enum Commands {
     Import,
     /// Check for and install new releases from GitHub
     SelfUpdate {
-        /// Do not download README.md after installing
-        #[arg(long)]
-        no_download_readme: bool,
-        /// Do not open README.md after downloading (only applies if download runs)
+        /// Do not open the documentation site after installing
         #[arg(long)]
         no_open_readme: bool,
-        /// Only check if an update is available; do not install or download README
+        /// Only check if an update is available; do not install
         #[arg(long)]
         check_only: bool,
         /// Skip SHA-256 checksum verification (use only if the release predates sidecar support)
@@ -96,7 +97,7 @@ enum Commands {
         #[command(subcommand)]
         sub: SyncSub,
     },
-    /// Download and open the latest README from the repository
+    /// Open the documentation site in the browser
     OpenReadme,
     /// Generate shell completion script
     Completion {
@@ -106,18 +107,8 @@ enum Commands {
         #[arg(long)]
         install: bool,
     },
-    /// Set (or clear) the editor in global settings
-    SetEditor {
-        /// Editor command to use (e.g. "code", "zed", "vim"). Omit to show current value.
-        editor: Option<String>,
-        /// Remove the editor setting (fall back to $EDITOR / OS default)
-        #[arg(long)]
-        clear: bool,
-    },
-    /// Print the global config file (gcloud-switch.toml)
+    /// Print the global settings file (gcloud-switch.toml) and its path
     ShowConfig,
-    /// Open the global config file in an editor
-    EditConfig,
 }
 
 #[derive(Subcommand)]
@@ -154,10 +145,6 @@ struct GlobalSettings {
     /// List of filenames to sync (default: ["profiles.toml"])
     #[serde(default = "default_sync_files")]
     sync_files: Vec<String>,
-    /// Editor command for opening files (e.g. "code", "zed", "vim").
-    /// Falls back to $EDITOR env var, then the OS default app.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    editor: Option<String>,
 }
 
 fn default_sync_files() -> Vec<String> {
@@ -172,7 +159,6 @@ impl Default for GlobalSettings {
             remote_url: None,
             branch: None,
             sync_files: default_sync_files(),
-            editor: None,
         }
     }
 }
@@ -187,23 +173,21 @@ fn global_settings_path() -> Option<PathBuf> {
     })
 }
 
-/// Load global settings. If the file does not exist, create ~/.config/gcloud-switch/gcloud-switch.toml with default values.
-fn load_global_settings() -> GlobalSettings {
-    let path = match global_settings_path() {
-        Some(p) => p,
-        None => return GlobalSettings::default(),
-    };
+/// Load global settings. If the file does not exist, create ~/.config/gcloud-switch/gcloud-switch.toml
+/// with default values. A file that exists but cannot be read or parsed is an error: resetting it
+/// to defaults would be written back over the user's file by the next save.
+fn load_global_settings() -> Result<GlobalSettings> {
+    let path = global_settings_path().context("Could not determine config directory")?;
     if path.exists() {
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => return GlobalSettings::default(),
-        };
-        return toml::from_str(&content).unwrap_or_default();
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        return toml::from_str(&content)
+            .with_context(|| format!("Failed to parse {}", path.display()));
     }
     // First run: create directory and write defaults
     let defaults = GlobalSettings::default();
-    let _ = save_global_settings(&defaults);
-    defaults
+    save_global_settings(&defaults)?;
+    Ok(defaults)
 }
 
 fn save_global_settings(settings: &GlobalSettings) -> Result<()> {
@@ -278,12 +262,19 @@ fn maybe_check_for_updates(settings: &mut GlobalSettings) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    // Parse into matches first: the subcommand NAME is what --html-help needs, and clap
+    // only hands it out at this level.
+    let matches = Cli::command().get_matches();
+    let subcommand = matches.subcommand_name().map(str::to_string);
+    let cli = Cli::from_arg_matches(&matches)?;
+    if cli.html_help {
+        return open_html_help(subcommand.as_deref());
+    }
 
     // Load/create global settings on first run (creates ~/.config/gcloud-switch/gcloud-switch.toml with defaults)
-    let mut global_settings = load_global_settings();
+    let mut global_settings = load_global_settings()?;
     // Optional: check for updates per global settings
-    if !matches!(cli.command, Some(Commands::SelfUpdate { .. }) | Some(Commands::OpenReadme) | Some(Commands::Completion { .. }) | Some(Commands::SetEditor { .. }) | Some(Commands::ShowConfig) | Some(Commands::EditConfig)) {
+    if !matches!(cli.command, Some(Commands::SelfUpdate { .. }) | Some(Commands::OpenReadme) | Some(Commands::Completion { .. }) | Some(Commands::ShowConfig)) {
         let _ = maybe_check_for_updates(&mut global_settings);
     }
 
@@ -375,15 +366,14 @@ fn main() -> Result<()> {
             }
         }
         Some(Commands::SelfUpdate {
-            no_download_readme,
             no_open_readme,
             check_only,
             skip_checksum,
         }) => {
-            run_self_update(!no_download_readme, !no_open_readme, check_only, skip_checksum, global_settings.editor.as_deref())?;
+            run_self_update(!no_open_readme, check_only, skip_checksum)?;
         }
         Some(Commands::OpenReadme) => {
-            run_open_readme(global_settings.editor.as_deref())?;
+            open_url(DOCS_URL)?;
         }
         Some(Commands::Completion { shell, install }) => {
             let using_default = shell.is_none();
@@ -394,39 +384,13 @@ fn main() -> Result<()> {
             let install = install || (using_default && cfg!(target_os = "macos"));
             run_completion(&shell, install)?;
         }
-        Some(Commands::SetEditor { editor, clear }) => {
-            if clear {
-                global_settings.editor = None;
-                save_global_settings(&global_settings)?;
-                println!("✅ editor cleared (will fall back to $EDITOR / OS default).");
-            } else if let Some(e) = editor {
-                global_settings.editor = Some(e.clone());
-                save_global_settings(&global_settings)?;
-                println!("✅ editor set to \"{}\".", e);
-            } else {
-                match &global_settings.editor {
-                    Some(e) => println!("editor = \"{}\"", e),
-                    None => println!("editor is not set (using $EDITOR / OS default)."),
-                }
-            }
-        }
         Some(Commands::ShowConfig) => {
+            // load_global_settings() created the file with defaults if it was missing.
             let path = global_settings_path().context("Could not determine config directory")?;
-            if path.exists() {
-                let content = std::fs::read_to_string(&path)
-                    .with_context(|| format!("Failed to read {}", path.display()))?;
-                print!("{}", content);
-            } else {
-                println!("Config file does not exist yet: {}", path.display());
-            }
-        }
-        Some(Commands::EditConfig) => {
-            let path = global_settings_path().context("Could not determine config directory")?;
-            if !path.exists() {
-                // Ensure the file exists before opening
-                save_global_settings(&global_settings)?;
-            }
-            open_file(&path, global_settings.editor.as_deref())?;
+            let content = std::fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read {}", path.display()))?;
+            println!("# {}", path.display());
+            print!("{}", content);
         }
         Some(Commands::Sync { sub }) => {
             let store = Store::new()?;
@@ -729,10 +693,14 @@ fn run_tui() -> Result<()> {
     loop_result
 }
 
-const REPO: &str = "tjirsch/rs-gcloud-switch";
+const REPO: &str = "tjirsch/gcloud-switch";
 const API_URL: &str = "https://api.github.com/repos";
+/// The documentation site: README.md and docs/*.md rendered from this repository's
+/// Markdown on every release tag (`.github/workflows/pages.yml`).
+const DOCS_URL: &str = "https://tjirsch.github.io/gcloud-switch/";
 
-fn run_self_update(download_readme: bool, open_readme: bool, check_only: bool, skip_checksum: bool, editor: Option<&str>) -> Result<()> {
+#[cfg_attr(windows, allow(unused_variables))]
+fn run_self_update(open_docs: bool, check_only: bool, skip_checksum: bool) -> Result<()> {
     let current_version = env!("CARGO_PKG_VERSION");
     println!("Current version: {}", current_version);
 
@@ -835,12 +803,9 @@ fn run_self_update(download_readme: bool, open_readme: bool, check_only: bool, s
             if status.success() {
                 println!("✅ Update installed successfully!");
                 println!("   Please restart your terminal or run: source ~/.profile");
-                if download_readme {
-                    match download_and_open_readme(&client, REPO, latest_version, open_readme, editor) {
-                        Ok(Some(path)) => println!("README: {}", path.display()),
-                        Ok(None) => {}
-                        Err(e) => eprintln!("⚠️  Warning: Could not download README: {}", e),
-                    }
+                println!("   Documentation: {}", DOCS_URL);
+                if open_docs {
+                    open_url(DOCS_URL)?;
                 }
             } else {
                 anyhow::bail!("Failed to run installer script");
@@ -860,134 +825,57 @@ fn run_self_update(download_readme: bool, open_readme: bool, check_only: bool, s
     Ok(())
 }
 
-fn download_and_open_readme(
-    client: &reqwest::blocking::Client,
-    repo: &str,
-    version: &str,
-    open_after_download: bool,
-    editor: Option<&str>,
-) -> Result<Option<PathBuf>> {
-    let download_dir = get_download_dir()?;
-    let readme_path = download_dir.join(format!("gcloud-switch-{}-README.md", version));
-    let readme_url = format!("https://raw.githubusercontent.com/{}/main/README.md", repo);
-    println!("\n📄 Downloading README...");
-    let readme_content = client.get(&readme_url).send()?.text()?;
-    std::fs::write(&readme_path, readme_content)?;
-    if open_after_download {
-        open_file(&readme_path, editor)?;
-    }
-    Ok(Some(readme_path))
-}
-
-fn get_download_dir() -> Result<PathBuf> {
+/// Open a URL in the default browser (never an editor).
+fn open_url(url: &str) -> Result<()> {
+    println!("Opening {}", url);
     #[cfg(target_os = "macos")]
-    {
-        let home = std::env::var("HOME")?;
-        Ok(PathBuf::from(home).join("Downloads"))
-    }
-
+    let status = std::process::Command::new("open").arg(url).status();
     #[cfg(target_os = "linux")]
-    {
-        if let Ok(dir) = std::env::var("XDG_DOWNLOAD_DIR") {
-            Ok(PathBuf::from(dir))
-        } else {
-            let home = std::env::var("HOME")?;
-            Ok(PathBuf::from(home).join("Downloads"))
-        }
-    }
-
+    let status = std::process::Command::new("xdg-open").arg(url).status();
     #[cfg(target_os = "windows")]
-    {
-        let user_profile = std::env::var("USERPROFILE")?;
-        Ok(PathBuf::from(user_profile).join("Downloads"))
-    }
-
+    let status = std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .status();
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        anyhow::bail!("Unsupported platform for download directory");
+    let status: std::io::Result<std::process::ExitStatus> =
+        Err(std::io::Error::other("no browser opener on this platform"));
+    match status {
+        Ok(st) if st.success() => Ok(()),
+        Ok(st) => anyhow::bail!("could not open {}: the opener exited with {}", url, st),
+        Err(e) => anyhow::bail!("could not open {}: {}", url, e),
     }
 }
 
-fn open_file(path: &Path, editor: Option<&str>) -> Result<()> {
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("File path {:?} contains non-UTF-8 characters", path))?;
-
-    let editor_env = std::env::var("EDITOR").ok();
-    let editor = editor.or(editor_env.as_deref());
-
-    if let Some(editor) = editor {
-        println!("   Opening '{}' with '{}'...", path_str, editor);
-        let result = std::process::Command::new(editor).arg(path).status();
-        match result {
-            Ok(_) => return Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                #[cfg(target_os = "macos")]
-                {
-                    let open_result = std::process::Command::new("open")
-                        .args(["-a", editor, path_str])
-                        .status();
-                    if open_result.map(|s| s.success()).unwrap_or(false) {
-                        return Ok(());
-                    }
-                }
-                anyhow::bail!(
-                    "Editor '{}' not found — is it installed and on your PATH?\n\
-                     Hint: set editor to the full path in ~/.config/gcloud-switch/gcloud-switch.toml\n\
-                     e.g.  editor = \"/usr/local/bin/zed\"",
-                    editor
-                );
-            }
-            Err(e) => anyhow::bail!("Failed to launch editor '{}': {}", editor, e),
-        }
-    }
-
-    // No editor configured — use OS default
-    #[cfg(target_os = "macos")]
-    {
-        println!("   Opening '{}' with system default app...", path_str);
-        std::process::Command::new("open").arg(path_str).status()?;
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        println!("   Opening '{}' with xdg-open...", path_str);
-        if std::process::Command::new("xdg-open")
-            .arg(path_str)
-            .status()
-            .is_err()
-        {
-            anyhow::bail!(
-                "Could not open '{}': xdg-open failed and neither editor nor $EDITOR is set",
-                path_str
+/// `--html-help`: the documentation site, at the invoked command's section when it has one.
+fn open_html_help(subcommand: Option<&str>) -> Result<()> {
+    // Commands with a `### … (`<cmd>`)` section in README.md; scripts/build-site.py gives
+    // such a heading `id="cmd-<cmd>"`.
+    const DOCUMENTED: &[&str] = &[
+        "add",
+        "list",
+        "activate",
+        "authenticate",
+        "import",
+        "sync",
+        "self-update",
+        "open-readme",
+        "completion",
+        "show-config",
+    ];
+    match subcommand {
+        Some(cmd) if DOCUMENTED.contains(&cmd) => open_url(&format!("{}#cmd-{}", DOCS_URL, cmd)),
+        Some(cmd) => {
+            println!(
+                "No section for `{}` on the documentation site yet; opening the command list.",
+                cmd
             );
+            open_url(&format!("{}#cli", DOCS_URL))
         }
+        None => open_url(DOCS_URL),
     }
-
-    #[cfg(target_os = "windows")]
-    {
-        println!("   Opening '{}' with system default app...", path_str);
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", path_str])
-            .status()?;
-    }
-
-    Ok(())
-}
-
-fn run_open_readme(editor: Option<&str>) -> Result<()> {
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("gcloud-switch-open-readme")
-        .build()?;
-    println!("📄 Downloading README...");
-    if let Some(path) = download_and_open_readme(&client, REPO, "latest", true, editor)? {
-        println!("README saved to: {}", path.display());
-    }
-    Ok(())
 }
 
 fn run_completion(shell_str: &str, install: bool) -> Result<()> {
-    use clap::CommandFactory;
     use clap_complete::{generate, Shell};
     use std::str::FromStr;
 

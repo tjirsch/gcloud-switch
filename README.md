@@ -1,5 +1,9 @@
 # gcloud-switch
 
+> **📖 Documentation: <https://tjirsch.github.io/gcloud-switch/>** — this README and the
+> [development notes](https://tjirsch.github.io/gcloud-switch/docs/development.html), searchable,
+> rebuilt on every release. Also: `gcloud-switch open-readme`, or `gcloud-switch <command> --html-help`.
+
 A TUI (Terminal User Interface) tool for managing and switching between multiple Google Cloud configurations. Quickly switch gcloud user credentials and Application Default Credentials (ADC) across different projects and accounts. Keeps gcloud and gcloud-switch data in sync.
 
 Fun and learning project of mine from serveral aspects: Rust, OSS, Public Repo, AI.
@@ -20,10 +24,10 @@ Fun and learning project of mine from serveral aspects: Rust, OSS, Public Repo, 
 Requires a working `gcloud` CLI installation.
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/tjirsch/rs-gcloud-switch/releases/latest/download/gcloud-switch-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/tjirsch/gcloud-switch/releases/latest/download/gcloud-switch-installer.sh | sh
 ```
 
-Prebuilt binaries can also be downloaded directly from the [Releases](https://github.com/tjirsch/rs-gcloud-switch/releases) page (macOS Intel + Apple Silicon, Linux x86_64 + ARM64).
+Prebuilt binaries can also be downloaded directly from the [Releases](https://github.com/tjirsch/gcloud-switch/releases) page (macOS Intel + Apple Silicon, Linux x86_64 + ARM64).
 
 ### macOS: "zsh: killed" error
 
@@ -103,73 +107,125 @@ Press `s` in the TUI to cycle through sync modes. The current mode is shown in t
 
 The sync mode is persisted across sessions.
 
-### CLI Subcommands
+## CLI
+
+Every command has `--help`. `gcloud-switch <command> --html-help` opens that command's section of the [documentation site](https://tjirsch.github.io/gcloud-switch/) in the browser; `gcloud-switch --html-help` opens the front page.
+
+| Command | Purpose |
+|---------|---------|
+| `add` | Add a profile |
+| `list` | List all profiles as a table, with the parts that are live |
+| `activate` | Activate a profile: its gcloud configuration, its ADC, or both |
+| `authenticate` | Log in for a profile without activating it |
+| `import` | Import existing gcloud configurations as profiles |
+| `sync` | Sync `profiles.toml` through a Git remote |
+| `self-update` | Install the latest release from GitHub |
+| `open-readme` | Open the documentation site |
+| `completion` | Generate or install shell completion |
+| `show-config` | Print the global settings file |
+
+### Add a profile (`add`)
 
 ```sh
-# Add a profile (the project is optional)
+# The project is optional
 gcloud-switch add myprofile --account user@example.com --project my-project
 gcloud-switch add adminprofile --account admin@example.com
 
-# Add with separate ADC settings ("" = no quota project)
+# Separate ADC settings ("" = no quota project)
 gcloud-switch add myprofile \
   --account user@example.com \
   --project my-project \
   --adc-account other@example.com \
   --adc-quota-project other-project
+```
 
-# List all profiles as a table; ACTIVE shows which parts are live (both, user, adc or -)
+The ADC account defaults to the user account, the ADC quota project to the user project. Both accounts are required. In sync modes strict and add, the gcloud configuration is created as well.
+
+### List profiles (`list`)
+
+```sh
 gcloud-switch list
+```
 
-# Activate a profile (non-interactive; logs in first if a credential is expired)
+One row per profile. `ACTIVE` shows which parts are live in gcloud: `both`, `user` (its configuration is gcloud's active one), `adc` (its stored credential is the live ADC file) or `-`. Empty fields print `-`.
+
+### Activate a profile (`activate`)
+
+```sh
 gcloud-switch activate myprofile          # user configuration and ADC
 gcloud-switch activate myprofile --user   # only the gcloud configuration
 gcloud-switch activate myprofile --adc    # only the Application Default Credentials
+```
 
-# Log in without activating (the previously live ADC is put back afterwards)
+The non-interactive counterpart of `Enter` in the TUI: a part whose credential is missing or expired is logged in first (see [Re-authentication](#re-authentication)), then the part is activated (see [Activation](#activation)).
+
+### Authenticate a profile (`authenticate`)
+
+```sh
 gcloud-switch authenticate myprofile          # user credentials and ADC
 gcloud-switch authenticate myprofile --user
 gcloud-switch authenticate myprofile --adc
-
-# Import existing gcloud configurations
-gcloud-switch import
-
-# Check for and install a new release from GitHub (runs the same installer as curl)
-gcloud-switch self-update
-
-# Only check if an update is available (no install, no README)
-gcloud-switch self-update --check-only
-
-# Skip downloading README after install, or skip opening it
-gcloud-switch self-update --no-download-readme
-gcloud-switch self-update --no-download-readme --no-open-readme
-
-# Download and open the latest README
-gcloud-switch open-readme
-
-# Generate shell completion script
-gcloud-switch completion bash --install   # installs to ~/.local/share/bash-completion/completions/
-gcloud-switch completion zsh --install    # installs to ~/.zsh/completions/_gcloud-switch
-gcloud-switch completion                  # macOS: defaults to zsh --install
-
-# Set editor for opening files
-gcloud-switch set-editor code
-gcloud-switch set-editor --clear   # revert to $EDITOR / OS default
-gcloud-switch set-editor           # show current setting
-
-# Print the global config file
-gcloud-switch show-config
-
-# Open the global config file in an editor
-gcloud-switch edit-config
 ```
 
-`switch` was replaced by `activate`. Re-run `gcloud-switch completion <shell> --install` after upgrading so tab completion knows the current commands.
+Logs in without activating. After an ADC login the ADC that was live before is put back, so authenticating one profile never switches another one's ADC.
 
-**Self-update options:** `--no-download-readme`, `--no-open-readme`, `--check-only`. The program can also check for updates automatically when you run other commands; this is controlled by the [configuration file](#configuration-configgcloud-switchgcloud-switchtoml) `~/.config/gcloud-switch/gcloud-switch.toml` (`self_update_frequency`: `never`, `always`, or `daily`).
+### Import gcloud configurations (`import`)
 
-`self-update` compares the current version with the latest GitHub release; if an update is available it downloads and runs the installer script, then optionally downloads the README to your Downloads folder and opens it. The editor used to open the README follows the priority: `editor` config → `$EDITOR` env var → OS default app.
+```sh
+gcloud-switch import
+```
 
-### Shell Completion
+Creates a profile for every gcloud configuration that has an account and is not a profile yet; the configuration's account and project become both parts of the profile.
+
+### Sync profiles via Git (`sync`)
+
+You can sync profile **metadata only** (profile names, account and project IDs) between machines using your own Git remote (e.g. a private GitHub repo). No credentials or tokens are ever synced; each machine keeps its own `gcloud auth` state.
+
+1. **One-time setup:** set the remote URL (and optional branch):
+   ```sh
+   gcloud-switch sync init https://github.com/you/your-repo.git
+   gcloud-switch sync init https://github.com/you/your-repo.git --branch main
+   ```
+   This stores the remote and branch in `~/.config/gcloud-switch/gcloud-switch.toml` and clones the repo into `~/.config/gcloud-switch/sync-repo/`. Use SSH or HTTPS; auth is your normal git config (SSH keys or credential helper).
+
+2. **Push** current profiles to the remote:
+   ```sh
+   gcloud-switch sync push
+   ```
+
+3. **Pull** and merge from the remote (newer profile wins per profile; new remote profiles are added; if the same profile changed on both sides you are prompted to keep local or remote):
+   ```sh
+   gcloud-switch sync pull
+   ```
+
+Merge is done profile-by-profile using an `updated_at` timestamp: the newer version wins. If both sides have the same timestamp and different content, the CLI prompts **Keep (L)ocal or (R)emote?**.
+
+### Self-update (`self-update`)
+
+```sh
+# Check for and install a new release (same installer as curl)
+gcloud-switch self-update
+
+# Only check if an update is available (no install)
+gcloud-switch self-update --check-only
+
+# Do not open the documentation site after installing
+gcloud-switch self-update --no-open-readme
+```
+
+Compares the current version with the latest GitHub release. When a newer version is available it downloads the installer script, verifies its SHA-256 checksum against the release's `.sha256` sidecar (`--skip-checksum` for a release without one), runs it, then prints the documentation URL and opens the site unless `--no-open-readme` is given.
+
+The program can also check for updates when you run other commands; `self_update_frequency` in the [global settings](#configuration-configgcloud-switchgcloud-switchtoml) controls this (`never`, `always`, or `daily`). That check only reports; it never installs.
+
+### Open the documentation (`open-readme`)
+
+```sh
+gcloud-switch open-readme
+```
+
+Opens the documentation site, <https://tjirsch.github.io/gcloud-switch/>, in the browser: this README and the development notes, rendered from the repository's Markdown on every release tag (`.github/workflows/pages.yml`).
+
+### Shell completion (`completion`)
 
 Generate tab-completion for your shell (`bash`, `zsh`, `fish`, `powershell`):
 
@@ -189,7 +245,7 @@ gcloud-switch completion fish --install
 # → installs to ~/.config/fish/completions/gcloud-switch.fish
 ```
 
-On macOS, running `gcloud-switch completion` without arguments defaults to `zsh --install`.
+On macOS, running `gcloud-switch completion` without arguments defaults to `zsh --install`. Re-run the install after upgrading so tab completion knows the current commands (`switch` was replaced by `activate`; `set-editor` and `edit-config` are gone).
 
 **Install locations for `--install`:**
 
@@ -241,46 +297,29 @@ Then install:
 gcloud-switch completion zsh --install
 ```
 
-### Sync profiles via Git (optional)
+### Show the global settings (`show-config`)
 
-You can sync profile **metadata only** (profile names, account and project IDs) between machines using your own Git remote (e.g. a private GitHub repo). No credentials or tokens are ever synced; each machine keeps its own `gcloud auth` state.
+```sh
+gcloud-switch show-config
+```
 
-1. **One-time setup:** set the remote URL (and optional branch):
-   ```sh
-   gcloud-switch sync init https://github.com/you/your-repo.git
-   gcloud-switch sync init https://github.com/you/your-repo.git --branch main
-   ```
-   This stores the remote and branch in `~/.config/gcloud-switch/gcloud-switch.toml` and clones the repo into `~/.config/gcloud-switch/sync-repo/`. Use SSH or HTTPS; auth is your normal git config (SSH keys or credential helper).
-
-2. **Push** current profiles to the remote:
-   ```sh
-   gcloud-switch sync push
-   ```
-
-3. **Pull** and merge from the remote (newer profile wins per profile; new remote profiles are added; if the same profile changed on both sides you are prompted to keep local or remote):
-   ```sh
-   gcloud-switch sync pull
-   ```
-
-Merge is done profile-by-profile using an `updated_at` timestamp: the newer version wins. If both sides have the same timestamp and different content, the CLI prompts **Keep (L)ocal or (R)emote?**.
+Prints the path of the global settings file and its content. Edit the file with any editor; the options are listed under [Configuration](#configuration-configgcloud-switchgcloud-switchtoml).
 
 ## Configuration (~/.config/gcloud-switch/gcloud-switch.toml)
 
-User-level **parameters** (e.g. when to check for updates, editor) live in **`~/.config/gcloud-switch/gcloud-switch.toml`**. This file is **created on first run** with default values (e.g. `self_update_frequency = "always"`). The folder `~/.config/gcloud-switch/` may already exist (e.g. installer leaves `gcloud-switch-receipt.json` there); the program creates it if needed and writes `gcloud-switch.toml` there.
+User-level **parameters** (when to check for updates, the Git sync remote) live in **`~/.config/gcloud-switch/gcloud-switch.toml`**. This file is **created on first run** with default values (`self_update_frequency = "always"`). The folder `~/.config/gcloud-switch/` may already exist (the installer leaves `gcloud-switch-receipt.json` there); the program creates it if needed. A file that exists but cannot be read or parsed is an error; it is never silently replaced with defaults.
 
 Example:
 
 ```toml
 self_update_frequency = "daily"
-editor = "zed"
 ```
-
-Use `gcloud-switch set-editor <editor>` to set the editor, `gcloud-switch show-config` to print the file, and `gcloud-switch edit-config` to open it in an editor.
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `self_update_frequency` | `"always"` | When to check for updates on normal runs: `never`, `always`, or `daily` (at most once per 24 hours). The check is check-only (no install, no README). |
-| `editor` | *(none)* | Editor command used to open files (e.g. `"zed"`, `"code"`, `"vim"`). Falls back to `$EDITOR` env var, then the OS default app. |
+| `self_update_frequency` | `"always"` | When to check for updates on normal runs: `never`, `always`, or `daily` (at most once per 24 hours). The check only reports; it never installs. |
+| `remote_url`, `branch` | *(none)* | Git remote and branch for `sync`, written by `gcloud-switch sync init`. |
+| `sync_files` | `["profiles.toml"]` | Files under `~/.config/gcloud/gcloud-switch/` that `sync push` and `sync pull` transfer. |
 
 **Profile data** stays in **`profiles.toml`** under `~/.config/gcloud/gcloud-switch/` (see [File Locations](#file-locations)); it is not stored in `~/.config/gcloud-switch/`.
 
@@ -328,7 +367,7 @@ When activating a part with an invalid token, gcloud-switch first runs, for that
 
 | Path | Description |
 |------|-------------|
-| `~/.config/gcloud-switch/gcloud-switch.toml` | User parameters (`self_update_frequency`, `editor`, Git sync `remote_url` and `branch`). Created on first run with defaults. |
+| `~/.config/gcloud-switch/gcloud-switch.toml` | User parameters (`self_update_frequency`, Git sync `remote_url` and `branch`). Created on first run with defaults. |
 | `~/.config/gcloud-switch/sync-repo/` | Git clone used for sync (profiles.toml only) |
 | `~/.config/gcloud/gcloud-switch/profiles.toml` | Profile definitions |
 | `~/.config/gcloud/gcloud-switch/adc/<name>.json` | Stored ADC credential per profile (mode 0600); the source of truth for that profile's ADC |
@@ -337,43 +376,18 @@ When activating a part with an invalid token, gcloud-switch first runs, for that
 | `~/.config/gcloud/active_config` | gcloud's active configuration pointer |
 | `~/.config/gcloud/application_default_credentials.json` | Live ADC file (written on activate, mode 0600) |
 
-## License
-
-MIT
-
 ## Development
 
 ```bash
-cargo install --path .     # Install from source
-cargo build                # Debug build
-cargo build --release      # Release build
-cargo run                  # Build and run the TUI
-cargo check                # Quick type-check without building
-cargo test                 # Run unit tests
-cargo clippy               # Lint
-cargo fmt                  # Format code
+cargo install --path .               # Install from source
+cargo build                          # Debug build
+cargo test                           # Run unit tests
+cargo clippy                         # Lint
+uv run scripts/build-site.py _site   # Render the documentation site into _site/
 ```
 
-### Architecture
+Architecture, design decisions, the release pipeline and how the documentation site is built: [development notes](docs/development.md).
 
-Seven modules with clear separation:
+## License
 
-- **main.rs** — CLI parsing (clap) and TUI lifecycle. Subcommands: `add`, `list`, `activate`, `authenticate`, `import`, `sync`, `self-update`, `open-readme`, `completion`, `set-editor`, `show-config`, `edit-config`, or no subcommand for the interactive TUI. Handles TUI suspend/resume when spawning interactive gcloud auth commands.
-- **app.rs** — Core state machine. Manages `InputMode` (Normal, Edit, AddProfile, ConfirmDelete), profile selection, background auth checking, edit suggestions, and pending actions. The `Column` enum (Both, User, ADC) selects the `Parts` that activate, authenticate and edit act on; `active_adc` tracks whose stored ADC credential is live.
-- **ui.rs** — Ratatui rendering. Layout is 4 rows: title, table, status bar, help line. Renders inline editing with cursor positioning and dropdown suggestion overlays.
-- **gcloud.rs** — All gcloud CLI and OAuth2 integration, and the activation/authentication core shared by TUI and CLI (`Parts`, `activate`, `authenticate`, `parts_needing_auth`, `active_adc_profile`). Manages configurations via gcloud CLI commands, queries `credentials.db` (SQLite, read-only) for OAuth tokens, validates user and stored ADC tokens via Google's token endpoint, and spawns `gcloud auth login` / `gcloud auth application-default login`.
-- **store.rs** — Persistent storage in `~/.config/gcloud/gcloud-switch/`. Profiles stored as TOML, ADC credentials as JSON files per profile (mode 0600).
-- **profile.rs** — Data structures: `Profile` (user_account, user_project, adc_account, adc_quota_project; the projects may be empty), `ProfilesFile`, `SyncMode`.
-- **sync.rs** — Git-based sync of `profiles.toml` through the system `git` CLI; the newer `updated_at` wins per profile.
-
-### Key Design Decisions
-
-- Auth validation runs on background threads (not tokio tasks) because `rusqlite` and `reqwest::blocking` would conflict with the tokio runtime. Auth checks are deduplicated by account.
-- TUI must suspend (restore terminal, drop alternate screen) before spawning interactive gcloud commands, then resume after.
-- `PendingAction` enum defers actions that require TUI suspension until the main loop can handle them outside the event handler.
-- Profile activation uses the gcloud CLI (`gcloud config set ... --configuration=<name>`, `gcloud config configurations activate`) so gcloud's internal state stays consistent. The ADC file is the only direct file operation (no gcloud CLI equivalent exists): the stored per-profile credential, stamped with the profile's quota project, is written to the live ADC path. `gcloud auth application-default set-quota-project` is not used because it edits only the live file, which may belong to another profile.
-- ADC validity is checked against the stored per-profile credential, not against the ADC account's user credential, so an ADC account that never ran `gcloud auth login` is not shown as expired.
-
-### Dependencies
-
-Key crates: `ratatui` + `crossterm` (TUI), `clap` (CLI), `reqwest` (HTTP for token validation), `rusqlite` with bundled SQLite (credentials.db access), `serde` + `toml` + `serde_json` (serialization), `anyhow` (error handling).
+MIT

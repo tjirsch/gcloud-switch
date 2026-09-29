@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -5,16 +6,26 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::TableState;
 
-use crate::gcloud;
+use crate::gcloud::{self, Parts};
 use crate::profile::{Profile, SyncMode};
 use crate::store::Store;
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Column {
     Both,
     User,
     Adc,
+}
+
+impl Column {
+    /// The profile parts this column selection targets.
+    pub fn parts(self) -> Parts {
+        match self {
+            Column::Both => Parts::BOTH,
+            Column::User => Parts::USER,
+            Column::Adc => Parts::ADC,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,11 +41,14 @@ pub enum InputMode {
     EditProject,
 }
 
-/// A shell command that requires TUI suspension (e.g. interactive gcloud auth).
+/// An interactive gcloud command (browser login) that needs the TUI suspended; the main loop
+/// runs it outside the event handler.
 pub enum PendingAction {
     None,
+    /// Explicit authenticate (`a`) of every part the selected column targets.
     Reauth,
-    ReauthAndActivate,
+    /// Activation that first needs a login for the parts whose credentials are invalid.
+    ReauthAndActivate { needing: Parts },
 }
 
 /// Result from a background auth check thread.
@@ -49,7 +63,10 @@ pub struct App {
     pub store: Store,
     pub profile_names: Vec<String>,
     pub profiles: Vec<Profile>,
+    /// The profile whose user configuration is gcloud's active configuration.
     pub active_profile: Option<String>,
+    /// The profile whose stored ADC credential is the live ADC file.
+    pub active_adc: Option<String>,
     pub user_auth_valid: Vec<Option<bool>>,
     pub adc_auth_valid: Vec<Option<bool>>,
     pub selected_row: usize,
@@ -91,6 +108,7 @@ impl App {
 
         let profile_names: Vec<String> = data.profiles.keys().cloned().collect();
         let profiles: Vec<Profile> = data.profiles.values().cloned().collect();
+        let active_adc = gcloud::active_adc_profile(&store, data.profiles.keys())?;
         let active_profile = data.active_profile;
         let sync_mode = data.sync_mode;
 
@@ -111,6 +129,7 @@ impl App {
             profile_names,
             profiles,
             active_profile,
+            active_adc,
             user_auth_valid: Vec::new(),
             adc_auth_valid: Vec::new(),
             selected_row,
@@ -150,43 +169,57 @@ impl App {
         Ok(app)
     }
 
-    /// Spawn background threads to check auth for all unique accounts.
+    /// Spawn background threads that check every credential: user credentials once per
+    /// account (they live in gcloud's credentials.db), ADC credentials once per profile (they
+    /// are stored per profile).
     fn start_auth_checks(&mut self) {
         self.auth_generation += 1;
         let gen = self.auth_generation;
         self.user_auth_valid = vec![None; self.profiles.len()];
         self.adc_auth_valid = vec![None; self.profiles.len()];
 
-        // Deduplicate: group (profile_index, is_user) by account email
-        let mut account_targets: std::collections::HashMap<String, Vec<(usize, bool)>> =
-            std::collections::HashMap::new();
+        let mut user_targets: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, profile) in self.profiles.iter().enumerate() {
-            if !profile.user_account.is_empty() {
-                account_targets
+            if profile.user_account.is_empty() {
+                self.user_auth_valid[i] = Some(false);
+            } else {
+                user_targets
                     .entry(profile.user_account.clone())
                     .or_default()
-                    .push((i, true));
-            }
-            if !profile.adc_account.is_empty() {
-                account_targets
-                    .entry(profile.adc_account.clone())
-                    .or_default()
-                    .push((i, false));
+                    .push(i);
             }
         }
-
-        for (account, targets) in account_targets {
+        for (account, targets) in user_targets {
             let tx = self.auth_tx.clone();
             std::thread::spawn(move || {
                 let valid = gcloud::check_account_auth(&account);
-                for (idx, is_user) in targets {
+                for idx in targets {
                     let _ = tx.send(AuthResult {
                         generation: gen,
                         profile_index: idx,
-                        is_user,
+                        is_user: true,
                         valid,
                     });
                 }
+            });
+        }
+
+        for (i, (name, profile)) in self.profile_names.iter().zip(&self.profiles).enumerate() {
+            if !self.store.has_adc(name) {
+                self.adc_auth_valid[i] = Some(false);
+                continue;
+            }
+            let path = self.store.adc_path(name);
+            let account = profile.adc_account.clone();
+            let tx = self.auth_tx.clone();
+            std::thread::spawn(move || {
+                let valid = gcloud::check_adc_auth_at(path, account);
+                let _ = tx.send(AuthResult {
+                    generation: gen,
+                    profile_index: i,
+                    is_user: false,
+                    valid,
+                });
             });
         }
     }
@@ -237,6 +270,7 @@ impl App {
         self.profile_names = data.profiles.keys().cloned().collect();
         self.profiles = data.profiles.values().cloned().collect();
         self.active_profile = data.active_profile;
+        self.active_adc = gcloud::active_adc_profile(&self.store, self.profile_names.iter())?;
         if self.selected_row >= self.profile_names.len() {
             self.selected_row = self.profile_names.len().saturating_sub(1);
         }
@@ -302,12 +336,19 @@ impl App {
             KeyCode::Enter => {
                 if !self.profile_names.is_empty() {
                     self.quit_after_activate = !key.modifiers.contains(KeyModifiers::ALT);
-                    self.activate_selected()?;
-                    // Only quit now if no pending reauth (otherwise quit after reauth completes)
-                    if self.quit_after_activate
-                        && matches!(self.pending_action, PendingAction::None)
-                    {
-                        self.should_quit = true;
+                    match self.activate_selected() {
+                        Ok(()) => {
+                            // Quit now only when no login is pending; otherwise after it completes.
+                            if self.quit_after_activate
+                                && matches!(self.pending_action, PendingAction::None)
+                            {
+                                self.should_quit = true;
+                            }
+                        }
+                        Err(e) => {
+                            self.quit_after_activate = false;
+                            self.status_message = Some(format!("Activation failed: {:#}", e));
+                        }
                     }
                 }
             }
@@ -332,12 +373,12 @@ impl App {
                     self.edit_account_buffer = match edit_col {
                         Column::User => profile.user_account.clone(),
                         Column::Adc => profile.adc_account.clone(),
-                        _ => unreachable!(),
+                        Column::Both => unreachable!("Both is mapped to User above"),
                     };
                     self.edit_project_buffer = match edit_col {
                         Column::User => profile.user_project.clone(),
                         Column::Adc => profile.adc_quota_project.clone(),
-                        _ => unreachable!(),
+                        Column::Both => unreachable!("Both is mapped to User above"),
                     };
                     self.input_mode = InputMode::EditAccount;
                     self.edit_cursor_pos = self.edit_account_buffer.chars().count();
@@ -371,7 +412,7 @@ impl App {
                 self.status_message = Some(format!("Sync mode: {}", label));
             }
             KeyCode::Char('i') => {
-                let configs = gcloud::discover_existing_configs()?;
+                let configs = gcloud::importable_configs()?;
                 if configs.is_empty() {
                     self.status_message = Some("No gcloud configurations found.".to_string());
                 } else {
@@ -424,6 +465,8 @@ impl App {
                 match self.input_mode {
                     InputMode::AddProfileName => {
                         if value.is_empty() {
+                            self.status_message =
+                                Some("Profile name is required. Enter profile name:".to_string());
                             return Ok(());
                         }
                         self.new_profile_name = value;
@@ -433,20 +476,22 @@ impl App {
                     }
                     InputMode::AddProfileUserAccount => {
                         if value.is_empty() {
+                            self.status_message = Some(
+                                "User account is required. Enter user account (email):"
+                                    .to_string(),
+                            );
                             return Ok(());
                         }
                         self.new_profile.user_account = value.clone();
                         self.new_profile.adc_account = value; // default
                         self.input_buffer.clear();
                         self.input_mode = InputMode::AddProfileUserProject;
-                        self.status_message = Some("Enter user project:".to_string());
+                        self.status_message =
+                            Some("Enter user project (empty = none):".to_string());
                     }
                     InputMode::AddProfileUserProject => {
-                        if value.is_empty() {
-                            return Ok(());
-                        }
-                        self.new_profile.user_project = value.clone();
-                        self.new_profile.adc_quota_project = value; // default
+                        // Empty = no project.
+                        self.new_profile.user_project = value;
                         self.input_buffer.clear();
                         self.input_mode = InputMode::AddProfileAdcAccount;
                         self.status_message = Some(format!(
@@ -455,35 +500,30 @@ impl App {
                         ));
                     }
                     InputMode::AddProfileAdcAccount => {
-                        // Empty = accept default from user profile (shown in brackets)
-                        self.new_profile.adc_account = if value.is_empty() {
-                            self.new_profile.adc_account.clone()
-                        } else {
-                            value
-                        };
-                        self.input_buffer.clear();
+                        // Empty = accept the default from the user account (shown in brackets),
+                        // which is never empty here.
+                        if !value.is_empty() {
+                            self.new_profile.adc_account = value;
+                        }
+                        // The quota project defaults to the user project. It is prefilled
+                        // rather than bracketed so it can be edited or emptied.
+                        self.input_buffer = self.new_profile.user_project.clone();
                         self.input_mode = InputMode::AddProfileAdcQuotaProject;
-                        self.status_message = Some(format!(
-                            "Enter ADC quota project [{}]:",
-                            self.new_profile.adc_quota_project
-                        ));
+                        self.status_message =
+                            Some("Enter ADC quota project (empty = none):".to_string());
                     }
                     InputMode::AddProfileAdcQuotaProject => {
-                        // Empty = accept default from user profile (shown in brackets)
-                        self.new_profile.adc_quota_project = if value.is_empty() {
-                            self.new_profile.adc_quota_project.clone()
-                        } else {
-                            value
-                        };
-                        // Create gcloud configuration first (if sync requires it)
+                        // The buffer as shown is the value; empty = no quota project.
+                        self.new_profile.adc_quota_project = value;
+                        // Create the gcloud configuration first (if sync requires it)
                         if matches!(self.sync_mode, SyncMode::Strict | SyncMode::Add) {
-                            if let Err(e) = gcloud::create_configuration(
+                            if let Err(e) = gcloud::write_configuration(
                                 &self.new_profile_name,
                                 &self.new_profile.user_account,
                                 &self.new_profile.user_project,
                             ) {
                                 self.status_message = Some(format!(
-                                    "Failed to create gcloud config: {}",
+                                    "Failed to create gcloud config: {:#}",
                                     e
                                 ));
                                 self.input_mode = InputMode::Normal;
@@ -728,157 +768,156 @@ impl App {
         seen.into_iter().collect()
     }
 
+    /// Save the edited part. The gcloud state follows the profile at once: the user part's
+    /// configuration is rewritten when sync is on, and a changed quota project is stamped into
+    /// the stored ADC credential (and the live ADC file when it is this profile's).
     fn save_edit(&mut self) -> Result<()> {
         let name = self.profile_names[self.selected_row].clone();
-        let old_profile = self.profiles[self.selected_row].clone();
-        let mut profile = old_profile.clone();
+        let old = self.profiles[self.selected_row].clone();
+        let account = self.edit_account_buffer.trim().to_string();
+        let project = self.edit_project_buffer.trim().to_string();
+        if account.is_empty() {
+            self.status_message = Some("Account is required.".to_string());
+            return Ok(());
+        }
+
+        let mut profile = old.clone();
         match self.edit_col {
             Column::User => {
-                profile.user_account = self.edit_account_buffer.trim().to_string();
-                profile.user_project = self.edit_project_buffer.trim().to_string();
+                profile.user_account = account;
+                profile.user_project = project;
             }
             Column::Adc => {
-                profile.adc_account = self.edit_account_buffer.trim().to_string();
-                profile.adc_quota_project = self.edit_project_buffer.trim().to_string();
+                profile.adc_account = account;
+                profile.adc_quota_project = project;
             }
-            _ => {}
+            Column::Both => unreachable!("edit_col is mapped to User or Adc before edit mode"),
         }
         self.store.add_profile(&name, profile.clone())?;
 
-        // If ADC account changed, clear auth status (needs re-check)
-        if self.edit_col == Column::Adc && profile.adc_account != old_profile.adc_account {
-            if let Some(slot) = self.adc_auth_valid.get_mut(self.selected_row) {
-                *slot = None;
-            }
-        }
-
-        // If ADC quota project changed, apply it via gcloud
-        if self.edit_col == Column::Adc
-            && profile.adc_quota_project != old_profile.adc_quota_project
-            && !profile.adc_quota_project.is_empty()
-        {
-            match gcloud::set_adc_quota_project(&profile.adc_quota_project) {
-                Ok(()) => {
-                    self.reload()?;
-                    self.input_mode = InputMode::Normal;
-                    self.suggestion_index = None;
-                    self.status_message = Some(format!(
-                        "Profile '{}' updated. ADC quota project set to '{}'.",
-                        name, profile.adc_quota_project
-                    ));
-                    return Ok(());
-                }
-                Err(e) => {
-                    self.reload()?;
-                    self.input_mode = InputMode::Normal;
-                    self.suggestion_index = None;
-                    self.status_message = Some(format!(
-                        "Profile '{}' updated. Failed to set quota project: {}",
-                        name, e
-                    ));
-                    return Ok(());
+        let mut note = String::new();
+        match self.edit_col {
+            Column::User => {
+                let changed = profile.user_account != old.user_account
+                    || profile.user_project != old.user_project;
+                if changed && matches!(self.sync_mode, SyncMode::Strict | SyncMode::Add) {
+                    note = match gcloud::write_configuration(
+                        &name,
+                        &profile.user_account,
+                        &profile.user_project,
+                    ) {
+                        Ok(()) => " gcloud configuration updated.".to_string(),
+                        Err(e) => format!(" Failed to update gcloud configuration: {:#}", e),
+                    };
                 }
             }
+            Column::Adc => {
+                if profile.adc_quota_project != old.adc_quota_project && self.store.has_adc(&name) {
+                    let result = if self.active_adc.as_deref() == Some(name.as_str()) {
+                        gcloud::activate_adc(&self.store, &name, &profile.adc_quota_project)
+                    } else {
+                        gcloud::update_stored_quota_project(
+                            &self.store,
+                            &name,
+                            &profile.adc_quota_project,
+                        )
+                    };
+                    note = match result {
+                        Ok(()) => " ADC quota project applied.".to_string(),
+                        Err(e) => format!(" Failed to apply ADC quota project: {:#}", e),
+                    };
+                }
+            }
+            Column::Both => {}
         }
 
         self.reload()?;
         self.input_mode = InputMode::Normal;
         self.suggestion_index = None;
-        self.status_message = Some(format!("Profile '{}' updated.", name));
+        self.status_message = Some(format!("Profile '{}' updated.{}", name, note));
         Ok(())
+    }
+
+    /// Whether one part of the selected profile has valid credentials: the background result
+    /// when it is in, otherwise a check now.
+    fn selected_part_valid(&self, user: bool) -> bool {
+        let cached = if user {
+            &self.user_auth_valid
+        } else {
+            &self.adc_auth_valid
+        };
+        if let Some(valid) = cached.get(self.selected_row).copied().flatten() {
+            return valid;
+        }
+        let name = &self.profile_names[self.selected_row];
+        let profile = &self.profiles[self.selected_row];
+        if user {
+            gcloud::check_account_auth(&profile.user_account)
+        } else {
+            gcloud::check_adc_auth(&self.store, name, profile)
+        }
     }
 
     fn activate_selected(&mut self) -> Result<()> {
-        // If auth check is still pending, do a synchronous check now
-        let user_valid = match self.user_auth_valid.get(self.selected_row).copied() {
-            Some(Some(v)) => v,
-            _ => {
-                let account = &self.profiles[self.selected_row].user_account;
-                gcloud::check_account_auth(account)
-            }
+        let parts = self.selected_col.parts();
+        let needing = Parts {
+            user: parts.user && !self.selected_part_valid(true),
+            adc: parts.adc && !self.selected_part_valid(false),
         };
-        let adc_valid = match self.adc_auth_valid.get(self.selected_row).copied() {
-            Some(Some(v)) => v,
-            _ => {
-                let account = &self.profiles[self.selected_row].adc_account;
-                gcloud::check_account_auth(account)
-            }
-        };
-
-        // Defer to main loop if interactive reauth is needed
-        let needs_reauth = match self.selected_col {
-            Column::Both => !user_valid || !adc_valid,
-            Column::User => !user_valid,
-            Column::Adc => !adc_valid,
-        };
-        if needs_reauth {
-            self.pending_action = PendingAction::ReauthAndActivate;
+        // Defer to the main loop if an interactive login is needed
+        if needing.any() {
+            self.pending_action = PendingAction::ReauthAndActivate { needing };
             return Ok(());
         }
+        self.do_activate()
+    }
 
-        self.do_activate()?;
+    /// Activate the selected column's parts of the selected profile.
+    fn do_activate(&mut self) -> Result<()> {
+        let name = self.profile_names[self.selected_row].clone();
+        let profile = self.profiles[self.selected_row].clone();
+        let parts = self.selected_col.parts();
+
+        gcloud::activate(&self.store, &name, &profile, parts)?;
+
+        if parts.user {
+            self.active_profile = Some(name.clone());
+            let mut data = self.store.load_profiles()?;
+            data.active_profile = Some(name.clone());
+            self.store.save_profiles(&data)?;
+        }
+        self.active_adc = gcloud::active_adc_profile(&self.store, self.profile_names.iter())?;
+        self.status_message = Some(format!("Activated {}.", parts.describe(&name)));
         Ok(())
     }
 
-    /// Execute activation (called directly or after reauth completes).
-    pub fn do_activate(&mut self) -> Result<()> {
+    /// Run a pending action's interactive gcloud commands; the caller has suspended the TUI.
+    /// The profile list is reloaded afterwards whether or not the action succeeded.
+    pub fn execute_pending(&mut self, pending: PendingAction) -> Result<()> {
         let name = self.profile_names[self.selected_row].clone();
         let profile = self.profiles[self.selected_row].clone();
+        let parts = self.selected_col.parts();
 
-        match self.selected_col {
-            Column::Both => {
-                gcloud::activate_both(
-                    &self.store,
-                    &name,
-                    &profile.user_account,
-                    &profile.user_project,
-                )?;
-                self.status_message = Some(format!("Activated profile '{}'.", name));
+        let result = match pending {
+            PendingAction::None => Ok(()),
+            PendingAction::Reauth => {
+                let all = self.store.load_profiles()?.profiles;
+                let result = gcloud::authenticate_only(&self.store, &all, &name, parts);
+                if result.is_ok() {
+                    self.status_message =
+                        Some(format!("Authenticated {}.", parts.describe(&name)));
+                }
+                result
             }
-            Column::User => {
-                gcloud::activate_user(&name, &profile.user_account, &profile.user_project)?;
-                self.status_message = Some(format!("Activated user config for '{}'.", name));
+            PendingAction::ReauthAndActivate { needing } => {
+                match gcloud::authenticate(&self.store, &name, &profile, needing) {
+                    Ok(()) => self.do_activate(),
+                    Err(e) => Err(e),
+                }
             }
-            Column::Adc => {
-                gcloud::activate_adc(&self.store, &name)?;
-                self.status_message = Some(format!("Activated ADC for '{}'.", name));
-            }
-        }
-
-        self.active_profile = Some(name.clone());
-        let mut data = self.store.load_profiles()?;
-        data.active_profile = Some(name.clone());
-        self.store.save_profiles(&data)?;
-
-        Ok(())
-    }
-
-    /// Execute a reauth that was deferred for TUI suspension.
-    pub fn execute_reauth(&mut self) -> Result<()> {
-        let name = self.profile_names[self.selected_row].clone();
-        let profile = self.profiles[self.selected_row].clone();
-
-        match self.selected_col {
-            Column::Both => {
-                gcloud::reauth_user(&profile.user_account)?;
-                gcloud::activate_user(&name, &profile.user_account, &profile.user_project)?;
-                gcloud::reauth_adc(&self.store, &name, &profile.adc_quota_project)?;
-                self.status_message =
-                    Some(format!("Re-authenticated user and ADC for '{}'.", name));
-            }
-            Column::User => {
-                gcloud::reauth_user(&profile.user_account)?;
-                gcloud::activate_user(&name, &profile.user_account, &profile.user_project)?;
-                self.status_message =
-                    Some(format!("User re-authenticated for '{}'.", name));
-            }
-            Column::Adc => {
-                gcloud::reauth_adc(&self.store, &name, &profile.adc_quota_project)?;
-                self.status_message = Some(format!("ADC re-authenticated for '{}'.", name));
-            }
-        }
+        };
 
         self.reload()?;
-        Ok(())
+        result
     }
 }

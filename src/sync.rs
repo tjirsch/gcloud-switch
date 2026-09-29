@@ -176,21 +176,21 @@ enum MergeChoice {
 }
 
 fn prompt_which_to_keep(name: &str, local: &Profile, remote: &Profile) -> Result<MergeChoice> {
+    fn dash(s: &str) -> &str {
+        if s.is_empty() { "-" } else { s }
+    }
+    let describe = |p: &Profile| {
+        format!(
+            "{} / {} (adc: {} / {})",
+            p.user_account,
+            dash(&p.user_project),
+            p.adc_account,
+            dash(&p.adc_quota_project)
+        )
+    };
     eprintln!("Profile '{}' changed on both sides.", name);
-    eprintln!(
-        "  Local:  {} / {} (adc: {} / {})",
-        local.user_account,
-        local.user_project,
-        local.adc_account,
-        local.adc_quota_project
-    );
-    eprintln!(
-        "  Remote: {} / {} (adc: {} / {})",
-        remote.user_account,
-        remote.user_project,
-        remote.adc_account,
-        remote.adc_quota_project
-    );
+    eprintln!("  Local:  {}", describe(local));
+    eprintln!("  Remote: {}", describe(remote));
     eprint!("Keep (L)ocal or (R)emote? [L/r]: ");
     io::stderr().flush()?;
     let mut buf = String::new();

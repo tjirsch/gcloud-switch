@@ -9,6 +9,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use clap::builder::NonEmptyStringValueParser;
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use crossterm::{
@@ -19,7 +20,8 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 
 use crate::app::{App, PendingAction};
-use crate::profile::{Profile, SyncMode};
+use crate::gcloud::Parts;
+use crate::profile::{Profile, ProfilesFile, SyncMode};
 use crate::store::Store;
 
 #[derive(Parser)]
@@ -36,24 +38,41 @@ enum Commands {
         /// Profile name
         name: String,
         /// User account email
-        #[arg(long)]
+        #[arg(long, value_parser = NonEmptyStringValueParser::new())]
         account: String,
-        /// User project
+        /// User project (omit for none)
         #[arg(long)]
-        project: String,
-        /// ADC account email (defaults to user account)
-        #[arg(long)]
+        project: Option<String>,
+        /// ADC account email (defaults to the user account)
+        #[arg(long, value_parser = NonEmptyStringValueParser::new())]
         adc_account: Option<String>,
-        /// ADC quota project (defaults to user project)
+        /// ADC quota project (defaults to the user project; pass "" for none)
         #[arg(long)]
         adc_quota_project: Option<String>,
     },
-    /// List all profiles
+    /// List all profiles with their active parts
     List,
-    /// Switch to a profile
-    Switch {
+    /// Activate a profile: its gcloud configuration, its ADC, or both (default)
+    Activate {
         /// Profile name
         name: String,
+        /// Only the user configuration (gcloud config)
+        #[arg(long, conflicts_with = "adc")]
+        user: bool,
+        /// Only the Application Default Credentials
+        #[arg(long)]
+        adc: bool,
+    },
+    /// Log in for a profile's user credentials, ADC, or both (default) without activating it
+    Authenticate {
+        /// Profile name
+        name: String,
+        /// Only the user credentials (gcloud auth login)
+        #[arg(long, conflicts_with = "adc")]
+        user: bool,
+        /// Only the Application Default Credentials
+        #[arg(long)]
+        adc: bool,
     },
     /// Import existing gcloud configurations
     Import,
@@ -278,45 +297,35 @@ fn main() -> Result<()> {
         }) => {
             let store = Store::new()?;
             let data = store.load_profiles()?;
+            // Empty means none for both projects.
+            let project = project.map(|p| p.trim().to_string()).unwrap_or_default();
+            let adc_quota_project = adc_quota_project
+                .map(|p| p.trim().to_string())
+                .unwrap_or_else(|| project.clone());
             let profile = Profile {
-                user_account: account.clone(),
-                user_project: project.clone(),
                 adc_account: adc_account.unwrap_or_else(|| account.clone()),
-                adc_quota_project: adc_quota_project.unwrap_or_else(|| project.clone()),
+                user_account: account,
+                user_project: project,
+                adc_quota_project,
                 updated_at: None,
             };
             // Create gcloud configuration first so the profile won't be orphaned
             if matches!(data.sync_mode, SyncMode::Strict | SyncMode::Add) {
-                gcloud::create_configuration(&name, &profile.user_account, &profile.user_project)?;
+                gcloud::write_configuration(&name, &profile.user_account, &profile.user_project)?;
             }
-            store.add_profile(&name, profile.clone())?;
+            store.add_profile(&name, profile)?;
             println!("Profile '{}' added.", name);
         }
         Some(Commands::List) => {
             let store = Store::new()?;
             let data = store.load_profiles()?;
             if data.profiles.is_empty() {
-                println!("No profiles configured. Use 'gcloud-switch add' or press 'a' in the TUI.");
+                println!("No profiles configured. Use 'gcloud-switch add' or press 'n' in the TUI.");
             } else {
-                for (name, profile) in &data.profiles {
-                    let active = if data.active_profile.as_deref() == Some(name.as_str()) {
-                        " (active)"
-                    } else {
-                        ""
-                    };
-                    println!(
-                        "{}{}: user={}@{} adc={}@{}",
-                        name,
-                        active,
-                        profile.user_account,
-                        profile.user_project,
-                        profile.adc_account,
-                        profile.adc_quota_project,
-                    );
-                }
+                print!("{}", list_table(&store, &data)?);
             }
         }
-        Some(Commands::Switch { name }) => {
+        Some(Commands::Activate { name, user, adc }) => {
             let store = Store::new()?;
             let mut data = store.load_profiles()?;
             let profile = data
@@ -324,20 +333,39 @@ fn main() -> Result<()> {
                 .get(&name)
                 .ok_or_else(|| anyhow::anyhow!("Profile '{}' not found", name))?
                 .clone();
+            let parts = parts_from_flags(user, adc);
 
-            // Check auth before activation (matches TUI behavior)
-            if !gcloud::check_account_auth(&profile.user_account) {
+            // Log in first for the parts whose credentials are invalid (matches the TUI).
+            let needing = gcloud::parts_needing_auth(&store, &name, &profile, parts);
+            if needing.user {
                 println!(
-                    "Credentials expired for '{}'. Re-authenticating...",
+                    "User credentials of {} are missing or expired. Logging in...",
                     profile.user_account
                 );
-                gcloud::reauth_user(&profile.user_account)?;
+            }
+            if needing.adc {
+                println!(
+                    "ADC of profile '{}' is missing or expired. Logging in as {}...",
+                    name, profile.adc_account
+                );
+            }
+            if needing.any() {
+                gcloud::authenticate(&store, &name, &profile, needing)?;
             }
 
-            gcloud::activate_both(&store, &name, &profile.user_account, &profile.user_project)?;
-            data.active_profile = Some(name.clone());
-            store.save_profiles(&data)?;
-            println!("Switched to profile '{}'.", name);
+            gcloud::activate(&store, &name, &profile, parts)?;
+            if parts.user {
+                data.active_profile = Some(name.clone());
+                store.save_profiles(&data)?;
+            }
+            println!("Activated {}.", parts.describe(&name));
+        }
+        Some(Commands::Authenticate { name, user, adc }) => {
+            let store = Store::new()?;
+            let data = store.load_profiles()?;
+            let parts = parts_from_flags(user, adc);
+            gcloud::authenticate_only(&store, &data.profiles, &name, parts)?;
+            println!("Authenticated {}.", parts.describe(&name));
         }
         Some(Commands::Import) => {
             let store = Store::new()?;
@@ -435,8 +463,68 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// `--user` / `--adc` flags to the parts they select; neither means both.
+fn parts_from_flags(user: bool, adc: bool) -> Parts {
+    Parts {
+        user: user || !adc,
+        adc: adc || !user,
+    }
+}
+
+/// The `list` output: one row per profile, marking the parts that are live in gcloud.
+fn list_table(store: &Store, data: &ProfilesFile) -> Result<String> {
+    let active_user = gcloud::read_active_config()?.filter(|n| data.profiles.contains_key(n));
+    let active_adc = gcloud::active_adc_profile(store, data.profiles.keys())?;
+    let dash = |s: &str| if s.is_empty() { "-".to_string() } else { s.to_string() };
+    let rows: Vec<Vec<String>> = data
+        .profiles
+        .iter()
+        .map(|(name, p)| {
+            let active = Parts {
+                user: active_user.as_deref() == Some(name.as_str()),
+                adc: active_adc.as_deref() == Some(name.as_str()),
+            };
+            vec![
+                name.clone(),
+                active.marker().to_string(),
+                dash(&p.user_account),
+                dash(&p.user_project),
+                dash(&p.adc_account),
+                dash(&p.adc_quota_project),
+            ]
+        })
+        .collect();
+    Ok(format_table(
+        &["NAME", "ACTIVE", "USER ACCOUNT", "PROJECT", "ADC ACCOUNT", "QUOTA PROJECT"],
+        &rows,
+    ))
+}
+
+/// Left-aligned columns separated by two spaces, one line per row, no trailing spaces.
+fn format_table(header: &[&str], rows: &[Vec<String>]) -> String {
+    let mut widths: Vec<usize> = header.iter().map(|h| h.len()).collect();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.len());
+        }
+    }
+    let line = |cells: &[&str]| -> String {
+        let mut out = String::new();
+        for (i, cell) in cells.iter().enumerate() {
+            out.push_str(&format!("{:<width$}  ", cell, width = widths[i]));
+        }
+        out.trim_end().to_string() + "\n"
+    };
+    let mut out = line(header);
+    for row in rows {
+        let cells: Vec<&str> = row.iter().map(String::as_str).collect();
+        out.push_str(&line(&cells));
+    }
+    out
+}
+
 fn import_profiles(store: &Store) -> Result<usize> {
-    let configs = gcloud::discover_existing_configs()?;
+    let configs = gcloud::importable_configs()?;
     if configs.is_empty() {
         return Ok(0);
     }
@@ -491,12 +579,16 @@ fn sync_on_startup(store: &Store) -> Result<()> {
     match data.sync_mode {
         SyncMode::Off => {}
         SyncMode::Add | SyncMode::Strict => {
-            let configs = gcloud::discover_existing_configs()?;
+            // Every configuration counts as existing (strict mode deletes profiles whose
+            // configuration is gone), but only those with an account become profiles.
             let config_names: std::collections::HashSet<String> =
-                configs.iter().map(|(n, _, _)| n.clone()).collect();
+                gcloud::discover_existing_configs()?
+                    .into_iter()
+                    .map(|(n, _, _)| n)
+                    .collect();
 
             // Add new gcloud configs as profiles
-            for (name, account, project) in &configs {
+            for (name, account, project) in &gcloud::importable_configs()? {
                 if !data.profiles.contains_key(name) {
                     let mut profile = Profile {
                         user_account: account.clone(),
@@ -574,8 +666,8 @@ fn run_tui() -> Result<()> {
 
             // Handle pending actions that need TUI suspended (interactive gcloud commands)
             if !matches!(app.pending_action, PendingAction::None) {
-                let is_activate = matches!(app.pending_action, PendingAction::ReauthAndActivate);
-                app.pending_action = PendingAction::None;
+                let pending = std::mem::replace(&mut app.pending_action, PendingAction::None);
+                let is_activate = matches!(pending, PendingAction::ReauthAndActivate { .. });
 
                 // Suspend TUI: leave alternate screen and restore normal terminal mode
                 disable_raw_mode()?;
@@ -590,19 +682,18 @@ fn run_tui() -> Result<()> {
                     io::stdout().flush()?;
                 }
 
-                // Run interactive gcloud commands
-                let reauth_result = app.execute_reauth();
-
-                // If reauth succeeded and this was an activate flow, do the activation
-                if is_activate && reauth_result.is_ok() {
-                    let _ = app.do_activate();
-                    if app.quit_after_activate {
-                        if let Some(msg) = &app.status_message {
-                            use std::io::Write;
-                            print!("\r\n{}\r\n", msg);
-                            io::stdout().flush()?;
+                // Run the interactive gcloud commands (and, for Enter, the activation)
+                match app.execute_pending(pending) {
+                    Ok(()) => {
+                        // The status message is printed once the terminal is restored below.
+                        if is_activate && app.quit_after_activate {
+                            return Ok(());
                         }
-                        return Ok(());
+                    }
+                    Err(e) => {
+                        // Show the failure in the TUI instead of quitting on it.
+                        app.quit_after_activate = false;
+                        app.status_message = Some(format!("Failed: {:#}", e));
                     }
                 }
 
@@ -700,7 +791,7 @@ fn run_self_update(download_readme: bool, open_readme: bool, check_only: bool, s
             Some(asset) => {
                 let expected_raw = client.get(&asset.browser_download_url)
                     .send()?.text()?;
-                let expected = expected_raw.trim().split_whitespace().next().unwrap_or("").to_lowercase();
+                let expected = expected_raw.split_whitespace().next().unwrap_or("").to_lowercase();
                 use sha2::{Digest, Sha256};
                 let actual = hex::encode(Sha256::digest(&installer_bytes));
                 if actual != expected {
@@ -823,7 +914,7 @@ fn open_file(path: &Path, editor: Option<&str>) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("File path {:?} contains non-UTF-8 characters", path))?;
 
     let editor_env = std::env::var("EDITOR").ok();
-    let editor = editor.or_else(|| editor_env.as_deref());
+    let editor = editor.or(editor_env.as_deref());
 
     if let Some(editor) = editor {
         println!("   Opening '{}' with '{}'...", path_str, editor);
@@ -889,9 +980,8 @@ fn run_open_readme(editor: Option<&str>) -> Result<()> {
         .user_agent("gcloud-switch-open-readme")
         .build()?;
     println!("📄 Downloading README...");
-    match download_and_open_readme(&client, REPO, "latest", true, editor)? {
-        Some(path) => println!("README saved to: {}", path.display()),
-        None => {}
+    if let Some(path) = download_and_open_readme(&client, REPO, "latest", true, editor)? {
+        println!("README saved to: {}", path.display());
     }
     Ok(())
 }
@@ -991,4 +1081,26 @@ fn compare_versions(v1: &str, v2: &str) -> i32 {
         }
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_table_aligns_columns_and_trims_trailing_spaces() {
+        let rows = vec![
+            vec!["a".to_string(), "both".to_string(), "x".to_string()],
+            vec!["longer".to_string(), "-".to_string(), String::new()],
+        ];
+        let out = format_table(&["NAME", "ACTIVE", "LAST"], &rows);
+        assert_eq!(out, "NAME    ACTIVE  LAST\na       both    x\nlonger  -\n");
+    }
+
+    #[test]
+    fn parts_from_flags_defaults_to_both() {
+        assert_eq!(parts_from_flags(false, false), Parts::BOTH);
+        assert_eq!(parts_from_flags(true, false), Parts::USER);
+        assert_eq!(parts_from_flags(false, true), Parts::ADC);
+    }
 }

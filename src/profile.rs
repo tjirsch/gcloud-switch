@@ -13,8 +13,10 @@ pub enum SyncMode {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Profile {
     pub user_account: String,
+    /// `core/project` of the gcloud configuration. Empty = none.
     pub user_project: String,
     pub adc_account: String,
+    /// `quota_project_id` of the ADC file. Empty = none.
     pub adc_quota_project: String,
     /// Unix timestamp (seconds) when this profile was last modified. Used for sync merge (newer wins). None = treat as old.
     #[serde(default)]

@@ -171,7 +171,9 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
         .zip(app.profiles.iter())
         .enumerate()
         .map(|(i, (name, profile))| {
-            let is_active = app.active_profile.as_deref() == Some(name.as_str());
+            let user_active = app.active_profile.as_deref() == Some(name.as_str());
+            let adc_active = app.active_adc.as_deref() == Some(name.as_str());
+            let is_active = user_active || adc_active;
             let is_selected = i == app.selected_row;
             let profile_name = name.to_string();
 
@@ -207,27 +209,37 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
             let col_highlight_bg = Color::Indexed(75); // lighter blue for selected column
             let edit_bg          = Color::Indexed(255); // Light Grey edit background
 
+            let active_style = Style::default().bg(light_grey).fg(Color::Green).add_modifier(Modifier::BOLD);
+            let plain_style  = Style::default().bg(light_grey).fg(Color::Black);
+
+            // The row and its profile-name cell are active when either part is.
             let base_style = if is_selected {
                 Style::default().bg(highlight_bg).fg(Color::White)
             } else if is_active {
-                Style::default().bg(light_grey).fg(Color::Green).add_modifier(Modifier::BOLD)
+                active_style
             } else {
-                Style::default().bg(light_grey).fg(Color::Black)
+                plain_style
             };
 
-            let col_style = |col: Column, editing: bool| -> Style {
+            // Each part cell shows its own active state: the user configuration and the ADC
+            // can belong to different profiles.
+            let col_style = |col: Column, active: bool, editing: bool| -> Style {
                 if editing {
                     Style::default().bg(edit_bg).fg(Color::Black)
                 } else if is_selected && app.selected_col == col {
                     Style::default().bg(col_highlight_bg).fg(Color::White).add_modifier(Modifier::BOLD)
-                } else {
+                } else if is_selected {
                     base_style
+                } else if active {
+                    active_style
+                } else {
+                    plain_style
                 }
             };
 
             let profile_style = base_style;
-            let user_style    = col_style(Column::User, is_editing && app.edit_col == Column::User);
-            let adc_style     = col_style(Column::Adc,  is_editing && app.edit_col == Column::Adc);
+            let user_style    = col_style(Column::User, user_active, is_editing && app.edit_col == Column::User);
+            let adc_style     = col_style(Column::Adc,  adc_active,  is_editing && app.edit_col == Column::Adc);
 
             Row::new(vec![
                 Cell::from(profile_name).style(profile_style),

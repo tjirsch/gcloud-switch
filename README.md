@@ -27,18 +27,7 @@ Requires a working `gcloud` CLI installation.
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/tjirsch/gcloud-switch/releases/latest/download/gcloud-switch-installer.sh | sh
 ```
 
-Prebuilt binaries can also be downloaded directly from the [Releases](https://github.com/tjirsch/gcloud-switch/releases) page (macOS Intel + Apple Silicon, Linux x86_64 + ARM64).
-
-### macOS: "zsh: killed" error
-
-macOS Gatekeeper quarantines unsigned binaries downloaded from the internet. To fix this:
-
-**CLI:**
-```sh
-xattr -d com.apple.quarantine /usr/local/bin/gcloud-switch
-```
-
-**GUI:** Right-click the binary in Finder, select **Open**, then confirm in the dialog. Alternatively, go to **System Settings > Privacy & Security** and click **Allow Anyway** after the first blocked attempt.
+Prebuilt binaries can also be downloaded directly from the [Releases](https://github.com/tjirsch/gcloud-switch/releases) page. Builds exist for macOS (Intel, Apple Silicon) and Linux (x86_64, ARM64); there is no native Windows build, so on Windows use the Linux x86_64 build inside WSL, where `gcloud` and its `~/.config/gcloud` live as on Linux.
 
 ## Usage
 

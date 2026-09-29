@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -72,22 +72,21 @@ impl Store {
         Ok(())
     }
 
-    #[allow(dead_code)]
+    /// The stored ADC credential of a profile, or `None` when none has been stored yet.
     pub fn load_adc_json(&self, profile_name: &str) -> Result<Option<serde_json::Value>> {
         let path = self.adc_path(profile_name);
         if !path.exists() {
             return Ok(None);
         }
-        let content = fs::read_to_string(&path)?;
-        let value: serde_json::Value = serde_json::from_str(&content)?;
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let value: serde_json::Value = serde_json::from_str(&content)
+            .with_context(|| format!("{} is not valid JSON", path.display()))?;
         Ok(Some(value))
     }
 
     pub fn save_adc_json(&self, profile_name: &str, value: &serde_json::Value) -> Result<()> {
-        let path = self.adc_path(profile_name);
-        let content = serde_json::to_string_pretty(value)?;
-        fs::write(path, content)?;
-        Ok(())
+        write_adc_file(&self.adc_path(profile_name), value)
     }
 
     pub fn has_adc(&self, profile_name: &str) -> bool {
@@ -120,4 +119,18 @@ impl Store {
 
         Ok(())
     }
+}
+
+/// Write a credential JSON file readable by its owner only (mode 0600 on unix), the same
+/// protection gcloud gives its own credentials.db.
+pub fn write_adc_file(path: &Path, value: &serde_json::Value) -> Result<()> {
+    let content = serde_json::to_string_pretty(value)?;
+    fs::write(path, content).with_context(|| format!("Failed to write {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("Failed to set permissions on {}", path.display()))?;
+    }
+    Ok(())
 }

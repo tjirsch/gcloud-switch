@@ -7,11 +7,12 @@ Fun and learning project of mine from serveral aspects: Rust, OSS, Public Repo, 
 ## Features
 
 - Interactive TUI for browsing and activating profiles
-- Manages both **user credentials** (`gcloud auth`) and **ADC** (`gcloud auth application-default`) per profile
-- Auto-detects expired tokens and triggers re-authentication before activation
-- Visual auth status indicators (🔑 valid / 🔒 expired) per profile
+- Manages both **user credentials** (`gcloud auth`) and **ADC** (`gcloud auth application-default`) per profile; each part can be activated or authenticated on its own
+- Projects are optional: a profile can have no user project and no ADC quota project
+- Auto-detects expired tokens and triggers re-authentication before activation, for the affected part only
+- Visual auth status indicators (🔑 valid / 🔒 expired) and active markers per part
 - Import existing gcloud configurations
-- CLI subcommands for scripting
+- CLI subcommands for scripting (`list`, `activate`, `authenticate`, `add`, ...)
 - Configurable sync with gcloud configurations (strict, add-only, or off)
 
 ## Installation
@@ -53,12 +54,14 @@ Opens an interactive table of profiles. Use the keyboard to navigate and activat
 | `Up` | Move selection up |
 | `Left` | Move column left (Both -> User) |
 | `Right` | Move column right (User -> ADC) |
-| `Enter` | Activate selected profile(s) and quit |
-| `Alt+Enter` | Activate selected profile(s) |
-| `a` | Re-authenticate selected profile(s) |
-| `e` | Edit selected profile in-place |
+| `Enter` | Activate the selected part(s) and quit |
+| `Alt+Enter` | Activate the selected part(s) and stay |
+| `a` | Authenticate (log in) the selected part(s) without activating |
+| `e` | Edit the selected part in-place |
 | `n` | Add a new profile |
-| `d` | Delete selected profile |
+| `d` | Delete the selected profile (the whole entry) |
+| `s` | Cycle the sync mode (strict, add, off) |
+| `i` | Import gcloud configurations that are not profiles yet |
 | `Esc` | Quit |
 
 #### Edit Mode
@@ -76,13 +79,17 @@ Suggestions include all account emails from existing profiles plus all authentic
 
 #### Add Profile
 
-When adding a profile (`n`), you are prompted for: profile name, user account, user project, ADC account, then ADC quota project. Prompts show defaults in **brackets**, e.g. `Enter ADC quota project [my-project]:`. **Press Enter with no input to accept the value in brackets** (ADC account and quota project default to the user account and project you just entered). Type a different value and press Enter to override.
+When adding a profile (`n`), you are prompted for: profile name, user account, user project, ADC account, then ADC quota project. Both accounts are required; both projects are optional (press Enter on an empty prompt for none). The ADC account prompt shows its default in **brackets**, e.g. `Enter ADC account [user@example.com]:`; press Enter with no input to accept it. The ADC quota project prompt is **prefilled** with the user project: press Enter to keep it, edit it, or delete it for no quota project.
 
 ### Column Selection
 
-- **Both** (default): Activates both user config and ADC together
-- **User**: Activates only the gcloud user configuration (account + project)
-- **ADC**: Activates only the Application Default Credentials
+`Left`/`Right` select which part of a profile `Enter` (activate), `a` (authenticate) and `e` (edit) act on:
+
+- **Both** (default): user configuration and ADC together
+- **User**: only the gcloud user configuration (account + project)
+- **ADC**: only the Application Default Credentials (account + quota project)
+
+Active markers are shown per part: the user cell is green when that profile's configuration is gcloud's active configuration, the ADC cell when that profile's stored ADC credential is the live ADC file. The two can belong to different profiles, e.g. after activating only the ADC of another entry.
 
 ### Sync Modes
 
@@ -99,21 +106,29 @@ The sync mode is persisted across sessions.
 ### CLI Subcommands
 
 ```sh
-# Add a profile
+# Add a profile (the project is optional)
 gcloud-switch add myprofile --account user@example.com --project my-project
+gcloud-switch add adminprofile --account admin@example.com
 
-# Add with separate ADC settings
+# Add with separate ADC settings ("" = no quota project)
 gcloud-switch add myprofile \
   --account user@example.com \
   --project my-project \
   --adc-account other@example.com \
   --adc-quota-project other-project
 
-# List all profiles
+# List all profiles as a table; ACTIVE shows which parts are live (both, user, adc or -)
 gcloud-switch list
 
-# Switch to a profile (non-interactive)
-gcloud-switch switch myprofile
+# Activate a profile (non-interactive; logs in first if a credential is expired)
+gcloud-switch activate myprofile          # user configuration and ADC
+gcloud-switch activate myprofile --user   # only the gcloud configuration
+gcloud-switch activate myprofile --adc    # only the Application Default Credentials
+
+# Log in without activating (the previously live ADC is put back afterwards)
+gcloud-switch authenticate myprofile          # user credentials and ADC
+gcloud-switch authenticate myprofile --user
+gcloud-switch authenticate myprofile --adc
 
 # Import existing gcloud configurations
 gcloud-switch import
@@ -147,6 +162,8 @@ gcloud-switch show-config
 # Open the global config file in an editor
 gcloud-switch edit-config
 ```
+
+`switch` was replaced by `activate`. Re-run `gcloud-switch completion <shell> --install` after upgrading so tab completion knows the current commands.
 
 **Self-update options:** `--no-download-readme`, `--no-open-readme`, `--check-only`. The program can also check for updates automatically when you run other commands; this is controlled by the [configuration file](#configuration-configgcloud-switchgcloud-switchtoml) `~/.config/gcloud-switch/gcloud-switch.toml` (`self_update_frequency`: `never`, `always`, or `daily`).
 
@@ -233,7 +250,7 @@ You can sync profile **metadata only** (profile names, account and project IDs) 
    gcloud-switch sync init https://github.com/you/your-repo.git
    gcloud-switch sync init https://github.com/you/your-repo.git --branch main
    ```
-   This writes `~/.config/gcloud/gcloud-switch/sync-config.toml` and clones the repo into `sync-repo/` under that directory. Use SSH or HTTPS; auth is your normal git config (SSH keys or credential helper).
+   This stores the remote and branch in `~/.config/gcloud-switch/gcloud-switch.toml` and clones the repo into `~/.config/gcloud-switch/sync-repo/`. Use SSH or HTTPS; auth is your normal git config (SSH keys or credential helper).
 
 2. **Push** current profiles to the remote:
    ```sh
@@ -281,43 +298,44 @@ adc_account = "user@example.com"
 adc_quota_project = "my-project"
 ```
 
+Both accounts are required. Both project fields may be empty (`""`): then no `core/project` is set on the gcloud configuration and no `quota_project_id` is written into the ADC file.
+
 ### Activation
 
-When a profile is activated:
+When a profile, or one part of it, is activated:
 
-1. **User config**: A gcloud configuration is created (if needed) and activated via `gcloud config configurations activate`, then account and project are set via `gcloud config set`
-2. **ADC**: The stored ADC JSON is copied to `~/.config/gcloud/application_default_credentials.json`
+1. **User config**: The gcloud configuration is created if needed, its account and project are written with `gcloud config set ... --configuration=<name>` (an empty project is `unset`), then it is made active via `gcloud config configurations activate`.
+2. **ADC**: The stored ADC credential (`adc/<name>.json`) is stamped with the profile's quota project (`quota_project_id` set, or removed when the quota project is empty) and written to `~/.config/gcloud/application_default_credentials.json`. The stored file is the source of truth: the live file is always "stored credential + the profile's quota project". If no credential is stored yet, an ADC login runs first.
+
+Editing a profile (`e`) applies the change at once: the user part rewrites the gcloud configuration (in sync modes strict and add), a changed quota project is stamped into the stored ADC credential and, when that credential is the live one, into the live ADC file.
 
 ### Auth Validation
 
-On startup, gcloud-switch reads `~/.config/gcloud/credentials.db` (a SQLite database maintained by gcloud) to look up stored OAuth2 credentials for each profile's account. It then performs a token refresh request to validate whether the credentials are still valid. The result is shown as a lock indicator:
+On startup, gcloud-switch validates each part with a token refresh request. User credentials come from `~/.config/gcloud/credentials.db` (a SQLite database maintained by gcloud), checked once per account. ADC credentials come from the profile's stored `adc/<name>.json`; a stored file that records a different account than the profile's ADC account counts as invalid. The result is shown as a lock indicator per part:
 
 - 🔑 Token is valid, profile can be activated immediately
 - 🔒 Token is expired or missing, re-authentication will be triggered on activation
 
 ### Re-authentication
 
-When activating a profile with an invalid token, gcloud-switch automatically runs:
-- `gcloud auth login --account=<email>` for user credentials
-- `gcloud auth application-default login` for ADC credentials
+When activating a part with an invalid token, gcloud-switch first runs, for that part only:
+- `gcloud auth login <email> --no-activate --force` for user credentials. `--no-activate` keeps gcloud's active configuration unchanged.
+- `gcloud auth application-default login --disable-quota-project` for ADC. Sign in with the profile's ADC account: gcloud-switch checks the account of the resulting credential and discards the login (restoring the previous ADC file) if it differs. It then stamps the profile's quota project into the credential and stores it for the profile.
 
-When activating with the column set to **Both**, this results in two separate browser-based auth dialogs — one for user credentials and one for ADC.
-
-You can also manually trigger re-auth with the `a` key.
+`a` (or `gcloud-switch authenticate`) logs in without activating. After an ADC login the ADC that was live before is put back, so authenticating one profile never switches another one's ADC.
 
 ## File Locations
 
 | Path | Description |
 |------|-------------|
-| `~/.config/gcloud-switch/gcloud-switch.toml` | User parameters (`self_update_frequency`, `editor`). Created on first run with defaults. |
+| `~/.config/gcloud-switch/gcloud-switch.toml` | User parameters (`self_update_frequency`, `editor`, Git sync `remote_url` and `branch`). Created on first run with defaults. |
+| `~/.config/gcloud-switch/sync-repo/` | Git clone used for sync (profiles.toml only) |
 | `~/.config/gcloud/gcloud-switch/profiles.toml` | Profile definitions |
-| `~/.config/gcloud/gcloud-switch/sync-config.toml` | Optional Git sync config (remote URL, branch) |
-| `~/.config/gcloud/gcloud-switch/sync-repo/` | Git clone used for sync (profiles.toml only) |
-| `~/.config/gcloud/gcloud-switch/adc/<name>.json` | Stored ADC credentials per profile |
+| `~/.config/gcloud/gcloud-switch/adc/<name>.json` | Stored ADC credential per profile (mode 0600); the source of truth for that profile's ADC |
 | `~/.config/gcloud/credentials.db` | gcloud's OAuth2 credential store (read-only) |
-| `~/.config/gcloud/configurations/` | gcloud configuration files (written on activate) |
+| `~/.config/gcloud/configurations/` | gcloud configuration files (written on add, edit and activate) |
 | `~/.config/gcloud/active_config` | gcloud's active configuration pointer |
-| `~/.config/gcloud/application_default_credentials.json` | Active ADC file |
+| `~/.config/gcloud/application_default_credentials.json` | Live ADC file (written on activate, mode 0600) |
 
 ## License
 
@@ -338,21 +356,23 @@ cargo fmt                  # Format code
 
 ### Architecture
 
-Six modules with clear separation:
+Seven modules with clear separation:
 
-- **main.rs** — CLI parsing (clap) and TUI lifecycle. Subcommands: `add`, `list`, `switch`, `import`, or no subcommand for interactive TUI. Handles TUI suspend/resume when spawning interactive gcloud auth commands.
-- **app.rs** — Core state machine. Manages `InputMode` (Normal, Edit, AddProfile, ConfirmDelete), profile selection, background auth checking, edit suggestions, and pending actions. The `Column` enum controls whether activation targets both user+ADC, user-only, or ADC-only credentials.
+- **main.rs** — CLI parsing (clap) and TUI lifecycle. Subcommands: `add`, `list`, `activate`, `authenticate`, `import`, `sync`, `self-update`, `open-readme`, `completion`, `set-editor`, `show-config`, `edit-config`, or no subcommand for the interactive TUI. Handles TUI suspend/resume when spawning interactive gcloud auth commands.
+- **app.rs** — Core state machine. Manages `InputMode` (Normal, Edit, AddProfile, ConfirmDelete), profile selection, background auth checking, edit suggestions, and pending actions. The `Column` enum (Both, User, ADC) selects the `Parts` that activate, authenticate and edit act on; `active_adc` tracks whose stored ADC credential is live.
 - **ui.rs** — Ratatui rendering. Layout is 4 rows: title, table, status bar, help line. Renders inline editing with cursor positioning and dropdown suggestion overlays.
-- **gcloud.rs** — All gcloud CLI and OAuth2 integration. Manages configurations via gcloud CLI commands, queries `credentials.db` (SQLite, read-only) for OAuth tokens, validates tokens via Google's token endpoint, and spawns `gcloud auth login` / `gcloud auth application-default login`.
-- **store.rs** — Persistent storage in `~/.config/gcloud/gcloud-switch/`. Profiles stored as TOML, ADC credentials as JSON files per profile.
-- **profile.rs** — Data structures: `Profile` (user_account, user_project, adc_account, adc_quota_project), `ProfilesFile`, `StateFile`.
+- **gcloud.rs** — All gcloud CLI and OAuth2 integration, and the activation/authentication core shared by TUI and CLI (`Parts`, `activate`, `authenticate`, `parts_needing_auth`, `active_adc_profile`). Manages configurations via gcloud CLI commands, queries `credentials.db` (SQLite, read-only) for OAuth tokens, validates user and stored ADC tokens via Google's token endpoint, and spawns `gcloud auth login` / `gcloud auth application-default login`.
+- **store.rs** — Persistent storage in `~/.config/gcloud/gcloud-switch/`. Profiles stored as TOML, ADC credentials as JSON files per profile (mode 0600).
+- **profile.rs** — Data structures: `Profile` (user_account, user_project, adc_account, adc_quota_project; the projects may be empty), `ProfilesFile`, `SyncMode`.
+- **sync.rs** — Git-based sync of `profiles.toml` through the system `git` CLI; the newer `updated_at` wins per profile.
 
 ### Key Design Decisions
 
 - Auth validation runs on background threads (not tokio tasks) because `rusqlite` and `reqwest::blocking` would conflict with the tokio runtime. Auth checks are deduplicated by account.
 - TUI must suspend (restore terminal, drop alternate screen) before spawning interactive gcloud commands, then resume after.
 - `PendingAction` enum defers actions that require TUI suspension until the main loop can handle them outside the event handler.
-- Profile activation uses gcloud CLI (`gcloud config configurations activate`, `gcloud config set`) to ensure gcloud's internal state stays consistent. ADC file copy is the only direct file operation (no gcloud CLI equivalent exists).
+- Profile activation uses the gcloud CLI (`gcloud config set ... --configuration=<name>`, `gcloud config configurations activate`) so gcloud's internal state stays consistent. The ADC file is the only direct file operation (no gcloud CLI equivalent exists): the stored per-profile credential, stamped with the profile's quota project, is written to the live ADC path. `gcloud auth application-default set-quota-project` is not used because it edits only the live file, which may belong to another profile.
+- ADC validity is checked against the stored per-profile credential, not against the ADC account's user credential, so an ADC account that never ran `gcloud auth login` is not shown as expired.
 
 ### Dependencies
 

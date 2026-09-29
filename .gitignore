@@ -1,6 +1,8 @@
 /target
 # the rendered documentation site (built by scripts/build-site.py, published by CI)
 _site/
+# Python bytecode the site scripts leave behind
+__pycache__/
 .DS_Store
 .claude
 .windsurf

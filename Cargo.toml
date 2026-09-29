@@ -4,8 +4,8 @@ version = "0.10.12"
 edition = "2021"
 description = "TUI Google Cloud profile switcher"
 license = "MIT"
-repository = "https://github.com/tjirsch/rs-gcloud-switch"
-homepage = "https://github.com/tjirsch/rs-gcloud-switch"
+repository = "https://github.com/tjirsch/gcloud-switch"
+homepage = "https://tjirsch.github.io/gcloud-switch/"
 
 [dependencies]
 anyhow = "1"

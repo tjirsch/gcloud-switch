@@ -1,0 +1,51 @@
+name: docs site
+
+# The documentation site: README.md and docs/*.md rendered to self-contained
+# HTML (scripts/build-site.py) and published on GitHub Pages. Runs on every
+# release tag — the site is versioned by the same tag the binary is — and on
+# demand (Actions → docs site → Run workflow).
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      # setup-uv publishes no moving major tag since v8: an exact release is the
+      # reference upstream documents, and it is bumped by hand.
+      # The cache is off — this repository has no dependency file for the cache key
+      # to read, so the key would never change and the cache would never invalidate.
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          enable-cache: false
+      - name: render
+        run: uv run scripts/build-site.py _site
+      - uses: actions/configure-pages@v6
+        with:
+          enablement: true
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

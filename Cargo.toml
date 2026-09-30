@@ -1,6 +1,6 @@
 [package]
 name = "gcloud-switch"
-version = "0.10.13"
+version = "0.11.0"
 edition = "2021"
 description = "TUI Google Cloud profile switcher"
 license = "MIT"

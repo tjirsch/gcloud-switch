@@ -6,7 +6,7 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::TableState;
 
-use crate::gcloud::{self, Parts};
+use crate::gcloud::{self, LiveState, Parts};
 use crate::profile::{Profile, SyncMode};
 use crate::store::Store;
 
@@ -51,11 +51,20 @@ pub enum PendingAction {
     ReauthAndActivate { needing: Parts },
 }
 
+/// What a background auth check judged.
+enum AuthTarget {
+    /// One part of the profile at this index in the table.
+    Profile { index: usize, user: bool },
+    /// The account of gcloud's active configuration.
+    LiveUser,
+    /// The live ADC file.
+    LiveAdc,
+}
+
 /// Result from a background auth check thread.
 struct AuthResult {
     generation: u64,
-    profile_index: usize,
-    is_user: bool,
+    target: AuthTarget,
     valid: bool,
 }
 
@@ -67,6 +76,12 @@ pub struct App {
     pub active_profile: Option<String>,
     /// The profile whose stored ADC credential is the live ADC file.
     pub active_adc: Option<String>,
+    /// What gcloud holds right now: its active configuration and its live ADC file.
+    pub live: LiveState,
+    /// Validity of the live user credential; `None` while unchecked or without one.
+    pub live_user_valid: Option<bool>,
+    /// Validity of the live ADC credential; `None` while unchecked or without one.
+    pub live_adc_valid: Option<bool>,
     pub user_auth_valid: Vec<Option<bool>>,
     pub adc_auth_valid: Vec<Option<bool>>,
     pub selected_row: usize,
@@ -108,8 +123,10 @@ impl App {
 
         let profile_names: Vec<String> = data.profiles.keys().cloned().collect();
         let profiles: Vec<Profile> = data.profiles.values().cloned().collect();
-        let active_adc = gcloud::active_adc_profile(&store, data.profiles.keys())?;
         let active_profile = data.active_profile;
+        let active_adc =
+            gcloud::active_adc_profile(&store, data.profiles.keys(), active_profile.as_deref())?;
+        let live = gcloud::live_state(&store, &data.profiles, active_profile.as_deref())?;
         let sync_mode = data.sync_mode;
 
         let selected_row = if let Some(ref active) = active_profile {
@@ -130,6 +147,9 @@ impl App {
             profiles,
             active_profile,
             active_adc,
+            live,
+            live_user_valid: None,
+            live_adc_valid: None,
             user_auth_valid: Vec::new(),
             adc_auth_valid: Vec::new(),
             selected_row,
@@ -171,12 +191,33 @@ impl App {
 
     /// Spawn background threads that check every credential: user credentials once per
     /// account (they live in gcloud's credentials.db), ADC credentials once per profile (they
-    /// are stored per profile).
+    /// are stored per profile), and the two live credentials.
     fn start_auth_checks(&mut self) {
         self.auth_generation += 1;
         let gen = self.auth_generation;
         self.user_auth_valid = vec![None; self.profiles.len()];
         self.adc_auth_valid = vec![None; self.profiles.len()];
+        self.live_user_valid = None;
+        self.live_adc_valid = None;
+
+        {
+            let live = self.live.clone();
+            let tx = self.auth_tx.clone();
+            std::thread::spawn(move || {
+                if let Some(valid) = gcloud::check_live_user_auth(&live) {
+                    let _ = tx.send(AuthResult { generation: gen, target: AuthTarget::LiveUser, valid });
+                }
+            });
+        }
+        {
+            let live = self.live.clone();
+            let tx = self.auth_tx.clone();
+            std::thread::spawn(move || {
+                if let Ok(Some(valid)) = gcloud::check_live_adc_auth(&live) {
+                    let _ = tx.send(AuthResult { generation: gen, target: AuthTarget::LiveAdc, valid });
+                }
+            });
+        }
 
         let mut user_targets: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, profile) in self.profiles.iter().enumerate() {
@@ -193,11 +234,10 @@ impl App {
             let tx = self.auth_tx.clone();
             std::thread::spawn(move || {
                 let valid = gcloud::check_account_auth(&account);
-                for idx in targets {
+                for index in targets {
                     let _ = tx.send(AuthResult {
                         generation: gen,
-                        profile_index: idx,
-                        is_user: true,
+                        target: AuthTarget::Profile { index, user: true },
                         valid,
                     });
                 }
@@ -216,8 +256,7 @@ impl App {
                 let valid = gcloud::check_adc_auth_at(path, account);
                 let _ = tx.send(AuthResult {
                     generation: gen,
-                    profile_index: i,
-                    is_user: false,
+                    target: AuthTarget::Profile { index: i, user: false },
                     valid,
                 });
             });
@@ -230,13 +269,16 @@ impl App {
             if result.generation != self.auth_generation {
                 continue;
             }
-            if result.profile_index >= self.profiles.len() {
-                continue;
-            }
-            if result.is_user {
-                self.user_auth_valid[result.profile_index] = Some(result.valid);
-            } else {
-                self.adc_auth_valid[result.profile_index] = Some(result.valid);
+            match result.target {
+                AuthTarget::Profile { index, .. } if index >= self.profiles.len() => {}
+                AuthTarget::Profile { index, user: true } => {
+                    self.user_auth_valid[index] = Some(result.valid)
+                }
+                AuthTarget::Profile { index, user: false } => {
+                    self.adc_auth_valid[index] = Some(result.valid)
+                }
+                AuthTarget::LiveUser => self.live_user_valid = Some(result.valid),
+                AuthTarget::LiveAdc => self.live_adc_valid = Some(result.valid),
             }
         }
     }
@@ -270,7 +312,12 @@ impl App {
         self.profile_names = data.profiles.keys().cloned().collect();
         self.profiles = data.profiles.values().cloned().collect();
         self.active_profile = data.active_profile;
-        self.active_adc = gcloud::active_adc_profile(&self.store, self.profile_names.iter())?;
+        self.active_adc = gcloud::active_adc_profile(
+            &self.store,
+            self.profile_names.iter(),
+            self.active_profile.as_deref(),
+        )?;
+        self.live = gcloud::live_state(&self.store, &data.profiles, self.active_profile.as_deref())?;
         if self.selected_row >= self.profile_names.len() {
             self.selected_row = self.profile_names.len().saturating_sub(1);
         }
@@ -880,14 +927,27 @@ impl App {
 
         gcloud::activate(&self.store, &name, &profile, parts)?;
 
+        let mut data = self.store.load_profiles()?;
         if parts.user {
-            self.active_profile = Some(name.clone());
-            let mut data = self.store.load_profiles()?;
             data.active_profile = Some(name.clone());
             self.store.save_profiles(&data)?;
+            self.active_profile = Some(name.clone());
         }
-        self.active_adc = gcloud::active_adc_profile(&self.store, self.profile_names.iter())?;
-        self.status_message = Some(format!("Activated {}.", parts.describe(&name)));
+        self.active_adc = gcloud::active_adc_profile(
+            &self.store,
+            self.profile_names.iter(),
+            self.active_profile.as_deref(),
+        )?;
+        self.live = gcloud::live_state(&self.store, &data.profiles, self.active_profile.as_deref())?;
+        // The live credentials are now this profile's, whose validity is already known.
+        let row = self.selected_row;
+        if parts.user {
+            self.live_user_valid = self.user_auth_valid.get(row).copied().flatten();
+        }
+        if parts.adc {
+            self.live_adc_valid = self.adc_auth_valid.get(row).copied().flatten();
+        }
+        self.status_message = Some(gcloud::activation_message(&name, &profile, parts));
         Ok(())
     }
 
@@ -901,8 +961,14 @@ impl App {
         let result = match pending {
             PendingAction::None => Ok(()),
             PendingAction::Reauth => {
-                let all = self.store.load_profiles()?.profiles;
-                let result = gcloud::authenticate_only(&self.store, &all, &name, parts);
+                let data = self.store.load_profiles()?;
+                let result = gcloud::authenticate_only(
+                    &self.store,
+                    &data.profiles,
+                    data.active_profile.as_deref(),
+                    &name,
+                    parts,
+                );
                 if result.is_ok() {
                     self.status_message =
                         Some(format!("Authenticated {}.", parts.describe(&name)));

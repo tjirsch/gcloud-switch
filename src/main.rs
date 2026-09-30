@@ -56,6 +56,9 @@ enum Commands {
     },
     /// List all profiles with their active parts
     List,
+    /// Show what gcloud holds now: the active configuration and the live ADC, each with its
+    /// profile and whether its credential is valid
+    Status,
     /// Activate a profile: its gcloud configuration, its ADC, or both (default)
     Activate {
         /// Profile name
@@ -274,7 +277,7 @@ fn main() -> Result<()> {
     // Load/create global settings on first run (creates ~/.config/gcloud-switch/gcloud-switch.toml with defaults)
     let mut global_settings = load_global_settings()?;
     // Optional: check for updates per global settings
-    if !matches!(cli.command, Some(Commands::SelfUpdate { .. }) | Some(Commands::OpenReadme) | Some(Commands::Completion { .. }) | Some(Commands::ShowConfig)) {
+    if !matches!(cli.command, Some(Commands::SelfUpdate { .. }) | Some(Commands::OpenReadme) | Some(Commands::Completion { .. }) | Some(Commands::ShowConfig) | Some(Commands::Status)) {
         let _ = maybe_check_for_updates(&mut global_settings);
     }
 
@@ -316,6 +319,14 @@ fn main() -> Result<()> {
                 print!("{}", list_table(&store, &data)?);
             }
         }
+        Some(Commands::Status) => {
+            let store = Store::new()?;
+            let data = store.load_profiles()?;
+            let state = gcloud::live_state(&store, &data.profiles, data.active_profile.as_deref())?;
+            let user_valid = gcloud::check_live_user_auth(&state);
+            let adc_valid = gcloud::check_live_adc_auth(&state)?;
+            print!("{}", status_report(&state, user_valid, adc_valid));
+        }
         Some(Commands::Activate { name, user, adc }) => {
             let store = Store::new()?;
             let mut data = store.load_profiles()?;
@@ -349,13 +360,19 @@ fn main() -> Result<()> {
                 data.active_profile = Some(name.clone());
                 store.save_profiles(&data)?;
             }
-            println!("Activated {}.", parts.describe(&name));
+            println!("{}", gcloud::activation_message(&name, &profile, parts));
         }
         Some(Commands::Authenticate { name, user, adc }) => {
             let store = Store::new()?;
             let data = store.load_profiles()?;
             let parts = parts_from_flags(user, adc);
-            gcloud::authenticate_only(&store, &data.profiles, &name, parts)?;
+            gcloud::authenticate_only(
+                &store,
+                &data.profiles,
+                data.active_profile.as_deref(),
+                &name,
+                parts,
+            )?;
             println!("Authenticated {}.", parts.describe(&name));
         }
         Some(Commands::Import) => {
@@ -438,7 +455,8 @@ fn parts_from_flags(user: bool, adc: bool) -> Parts {
 /// The `list` output: one row per profile, marking the parts that are live in gcloud.
 fn list_table(store: &Store, data: &ProfilesFile) -> Result<String> {
     let active_user = gcloud::read_active_config()?.filter(|n| data.profiles.contains_key(n));
-    let active_adc = gcloud::active_adc_profile(store, data.profiles.keys())?;
+    let active_adc =
+        gcloud::active_adc_profile(store, data.profiles.keys(), data.active_profile.as_deref())?;
     let dash = |s: &str| if s.is_empty() { "-".to_string() } else { s.to_string() };
     let rows: Vec<Vec<String>> = data
         .profiles
@@ -462,6 +480,41 @@ fn list_table(store: &Store, data: &ProfilesFile) -> Result<String> {
         &["NAME", "ACTIVE", "USER ACCOUNT", "PROJECT", "ADC ACCOUNT", "QUOTA PROJECT"],
         &rows,
     ))
+}
+
+/// The `status` output: one line per part with what gcloud holds, any drift from the
+/// profiles, and whether that credential is valid.
+fn status_report(
+    state: &gcloud::LiveState,
+    user_valid: Option<bool>,
+    adc_valid: Option<bool>,
+) -> String {
+    let validity = |valid: Option<bool>| match valid {
+        Some(true) => " \u{00b7} valid",
+        Some(false) => " \u{00b7} INVALID",
+        None => "",
+    };
+    let line = |label: &str, value: Option<(String, Option<String>)>, valid: Option<bool>| {
+        match value {
+            Some((description, note)) => format!(
+                "{:<14} {}{}{}\n",
+                label,
+                description,
+                note.map(|n| format!(" ({})", n)).unwrap_or_default(),
+                validity(valid)
+            ),
+            None => format!("{:<14} none\n", label),
+        }
+    };
+    line(
+        "configuration",
+        state.configuration.as_ref().map(|c| (c.describe(), c.drift_note())),
+        user_valid,
+    ) + &line(
+        "ADC",
+        state.adc.as_ref().map(|a| (a.describe(), a.drift_note())),
+        adc_valid,
+    )
 }
 
 /// Left-aligned columns separated by two spaces, one line per row, no trailing spaces.
@@ -853,6 +906,7 @@ fn open_html_help(subcommand: Option<&str>) -> Result<()> {
     const DOCUMENTED: &[&str] = &[
         "add",
         "list",
+        "status",
         "activate",
         "authenticate",
         "import",
@@ -973,6 +1027,35 @@ fn compare_versions(v1: &str, v2: &str) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn status_report_shows_both_parts_with_drift_and_validity() {
+        use crate::gcloud::{LiveAdc, LiveConfiguration, LiveState};
+        let state = LiveState {
+            configuration: Some(LiveConfiguration {
+                name: "mmt01".into(),
+                account: "a@x.com".into(),
+                project: "p".into(),
+                profile: Some("mmt01".into()),
+                differs: true,
+            }),
+            adc: Some(LiveAdc {
+                account: "a@x.com".into(),
+                quota_project: String::new(),
+                profile: Some("mmt01".into()),
+                differs: false,
+            }),
+        };
+        assert_eq!(
+            super::status_report(&state, Some(true), Some(false)),
+            "configuration  mmt01 \u{00b7} a@x.com \u{00b7} project p (differs from profile 'mmt01') \u{00b7} valid\n\
+             ADC            mmt01 \u{00b7} a@x.com \u{00b7} no quota project \u{00b7} INVALID\n"
+        );
+        assert_eq!(
+            super::status_report(&LiveState::default(), None, None),
+            "configuration  none\nADC            none\n"
+        );
+    }
+
     use super::*;
 
     #[test]

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use rusqlite::Connection;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::profile::Profile;
 use crate::store::{self, Store};
@@ -238,59 +238,231 @@ pub fn activate(store: &Store, name: &str, profile: &Profile, parts: Parts) -> R
     Ok(())
 }
 
-/// Interactive login for the requested parts.
+/// "project p" or "no project".
+fn describe_project(project: &str) -> String {
+    if project.is_empty() {
+        "no project".to_string()
+    } else {
+        format!("project {}", project)
+    }
+}
+
+/// "quota project q" or "no quota project".
+fn describe_quota_project(quota_project: &str) -> String {
+    if quota_project.is_empty() {
+        "no quota project".to_string()
+    } else {
+        format!("quota project {}", quota_project)
+    }
+}
+
+/// The status line after an activation: which parts, and the projects they now carry.
+pub fn activation_message(name: &str, profile: &Profile, parts: Parts) -> String {
+    match (parts.user, parts.adc) {
+        (true, true) => format!(
+            "Activated profile '{}': {}, ADC {}.",
+            name,
+            describe_project(&profile.user_project),
+            describe_quota_project(&profile.adc_quota_project)
+        ),
+        (true, false) => format!(
+            "Activated user configuration of '{}': {}.",
+            name,
+            describe_project(&profile.user_project)
+        ),
+        (false, true) => format!(
+            "Activated ADC of '{}': {}.",
+            name,
+            describe_quota_project(&profile.adc_quota_project)
+        ),
+        (false, false) => format!("Activated nothing of '{}'.", name),
+    }
+}
+
+/// Run `gcloud auth login` for the account. gcloud verifies that the browser signed in as
+/// that account and refuses otherwise. It never changes the active configuration. With
+/// `update_adc`, gcloud also writes the credential to the live ADC file; the caller reads it.
+fn login_user(account: &str, update_adc: bool) -> Result<()> {
+    let mut args = vec![
+        "auth",
+        "login",
+        account,
+        "--no-activate",
+        "--force",
+        "--verbosity=error",
+    ];
+    if update_adc {
+        args.push("--update-adc");
+    }
+    run_gcloud_interactive(&args)
+}
+
+/// The live ADC file's bytes, taken out of the way: gcloud skips an ADC login for an account
+/// the live file already names, valid or not, so the file must not be there during a login.
+/// `restore` puts it back (or removes what a failed login left) when the login does not end
+/// in a stored credential.
+struct LiveAdcAside {
+    path: PathBuf,
+    previous: Option<Vec<u8>>,
+}
+
+impl LiveAdcAside {
+    fn take() -> Result<Self> {
+        let path = live_adc_path()?;
+        let previous = fs::read(&path).ok();
+        if previous.is_some() {
+            fs::remove_file(&path)
+                .with_context(|| format!("Failed to move {} aside", path.display()))?;
+        }
+        Ok(Self { path, previous })
+    }
+
+    fn restore(self) -> Result<()> {
+        match self.previous {
+            Some(bytes) => fs::write(&self.path, bytes)
+                .with_context(|| format!("Failed to restore {}", self.path.display())),
+            None if self.path.exists() => fs::remove_file(&self.path)
+                .with_context(|| format!("Failed to remove {}", self.path.display())),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Read and parse the live ADC file after a login wrote it.
+fn read_live_adc(path: &std::path::Path) -> Result<Value> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("gcloud did not write {}", path.display()))?;
+    serde_json::from_str(&content).with_context(|| format!("{} is not valid JSON", path.display()))
+}
+
+/// Run `gcloud auth application-default login` for the account and return the credential it
+/// wrote. gcloud verifies that the browser signed in as that account, refuses otherwise, and
+/// records the account in the file. The quota project is left to the caller (gcloud would take
+/// it from the active configuration, which is another profile's during a switch). Whatever
+/// was live before is put back when the login fails.
+fn login_adc(account: &str) -> Result<Value> {
+    let aside = LiveAdcAside::take()?;
+    let result = run_gcloud_interactive(&[
+        "auth",
+        "application-default",
+        "login",
+        account,
+        "--disable-quota-project",
+        "--quiet",
+        "--verbosity=error",
+    ])
+    .and_then(|()| read_live_adc(&aside.path))
+    .and_then(|adc| {
+        if adc_account_matches(&adc, account) {
+            Ok(adc)
+        } else {
+            Err(anyhow!(
+                "The ADC login signed in as {}, not as {}. Nothing was stored.",
+                adc["account"].as_str().unwrap_or("?"),
+                account
+            ))
+        }
+    });
+    if result.is_err() {
+        aside.restore()?;
+    }
+    result
+}
+
+/// An ADC document built from the account's gcloud user credential in `credentials.db`: the
+/// same document `gcloud auth login --update-adc` writes, so no browser is needed while that
+/// credential is valid.
+fn adc_from_user_credential(account: &str) -> Result<Value> {
+    let creds = read_gcloud_credentials(account)?
+        .ok_or_else(|| anyhow!("gcloud holds no credential for {}", account))?;
+    match creds.get("type").and_then(Value::as_str) {
+        Some("authorized_user") => {}
+        other => anyhow::bail!(
+            "The gcloud credential of {} is of type {}, not authorized_user; only a user login can serve as ADC.",
+            account,
+            other.unwrap_or("unknown")
+        ),
+    }
+    let field = |key: &str| -> Result<Value> {
+        creds
+            .get(key)
+            .cloned()
+            .ok_or_else(|| anyhow!("The gcloud credential of {} has no {}", account, key))
+    };
+    let mut adc = json!({
+        "type": "authorized_user",
+        "client_id": field("client_id")?,
+        "client_secret": field("client_secret")?,
+        "refresh_token": field("refresh_token")?,
+    });
+    if let Some(universe) = creds.get("universe_domain") {
+        adc["universe_domain"] = universe.clone();
+    }
+    Ok(adc)
+}
+
+/// Record the account and the quota project in a fresh ADC credential, store it for the
+/// profile, write it live and say so. `origin` says where the credential came from.
+fn store_adc(store: &Store, name: &str, profile: &Profile, mut adc: Value, origin: &str) -> Result<()> {
+    let object = adc
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("ADC credential is not a JSON object"))?;
+    object.insert(
+        "account".to_string(),
+        Value::String(profile.adc_account.clone()),
+    );
+    stamp_quota_project(&mut adc, &profile.adc_quota_project)?;
+    store.save_adc_json(name, &adc)?;
+    store::write_adc_file(&live_adc_path()?, &adc)?;
+    println!(
+        "ADC of profile '{}' {} for {}, {}.",
+        name,
+        origin,
+        profile.adc_account,
+        describe_quota_project(&profile.adc_quota_project)
+    );
+    Ok(())
+}
+
+/// Interactive login for the requested parts: the ones the caller found invalid, or the ones
+/// the user asked to re-authenticate. Three shapes, by what is needed and whether the profile
+/// uses one account for both parts:
 ///
-/// The user login never changes the active configuration. The ADC login writes gcloud's live
-/// ADC file; that credential must belong to the profile's ADC account, is stamped with the
-/// profile's quota project, stored for the profile and written back live. Callers that only
-/// authenticate use `authenticate_only`, which puts the previously live ADC back afterwards.
+/// 1. both parts, one account: one browser login (`gcloud auth login --update-adc`) yields
+///    the user credential and the ADC.
+/// 2. the ADC alone, one account, and that account's user credential is valid: the ADC is
+///    derived from the user credential; no browser.
+/// 3. otherwise: `gcloud auth login` for the user part, and an ADC login with the profile's
+///    ADC account, which gcloud verifies against the browser.
+///
+/// Every stored ADC names its account, carries the profile's quota project and is written
+/// live as well. Callers that only authenticate use `authenticate_only`, which puts the
+/// previously live ADC back afterwards.
 pub fn authenticate(store: &Store, name: &str, profile: &Profile, parts: Parts) -> Result<()> {
+    let one_account = profile.adc_account == profile.user_account;
+    if parts.user && parts.adc && one_account {
+        let aside = LiveAdcAside::take()?;
+        let adc = login_user(&profile.user_account, true).and_then(|()| read_live_adc(&aside.path));
+        let adc = match adc {
+            Ok(adc) => adc,
+            Err(e) => {
+                aside.restore()?;
+                return Err(e);
+            }
+        };
+        return store_adc(store, name, profile, adc, "stored from the same login");
+    }
     if parts.user {
-        run_gcloud_interactive(&[
-            "auth",
-            "login",
-            &profile.user_account,
-            "--no-activate",
-            "--force",
-        ])?;
+        login_user(&profile.user_account, false)?;
     }
     if parts.adc {
-        // The account is deliberately not passed to gcloud: with it, gcloud skips the login
-        // whenever the live ADC file already names that account, even when that credential
-        // is expired. The account is checked below instead.
-        let live = live_adc_path()?;
-        let previous = fs::read(&live).ok();
-        run_gcloud_interactive(&[
-            "auth",
-            "application-default",
-            "login",
-            "--disable-quota-project",
-            "--quiet",
-        ])?;
-        let content = fs::read_to_string(&live).with_context(|| {
-            format!(
-                "gcloud auth application-default login did not write {}",
-                live.display()
-            )
-        })?;
-        let mut adc: Value = serde_json::from_str(&content)
-            .with_context(|| format!("{} is not valid JSON", live.display()))?;
-        if !adc_account_matches(&adc, &profile.adc_account) {
-            // Undo gcloud's write so the wrong account's credential is not left live.
-            match previous {
-                Some(bytes) => fs::write(&live, bytes)?,
-                None => fs::remove_file(&live)?,
-            }
-            anyhow::bail!(
-                "The ADC login used account {}, but the ADC account of profile '{}' is {}. Nothing was stored.",
-                adc["account"].as_str().unwrap_or("?"),
-                name,
-                profile.adc_account
-            );
+        if one_account && check_account_auth(&profile.user_account) {
+            let adc = adc_from_user_credential(&profile.user_account)?;
+            store_adc(store, name, profile, adc, "derived from the gcloud login (no browser)")?;
+        } else {
+            let adc = login_adc(&profile.adc_account)?;
+            store_adc(store, name, profile, adc, "stored")?;
         }
-        stamp_quota_project(&mut adc, &profile.adc_quota_project)?;
-        store.save_adc_json(name, &adc)?;
-        store::write_adc_file(&live, &adc)?;
     }
     Ok(())
 }
@@ -300,6 +472,7 @@ pub fn authenticate(store: &Store, name: &str, profile: &Profile, parts: Parts) 
 pub fn authenticate_only(
     store: &Store,
     all: &BTreeMap<String, Profile>,
+    active_profile: Option<&str>,
     name: &str,
     parts: Parts,
 ) -> Result<()> {
@@ -307,7 +480,7 @@ pub fn authenticate_only(
         .get(name)
         .ok_or_else(|| anyhow!("Profile '{}' not found", name))?;
     let previous_adc = if parts.adc {
-        active_adc_profile(store, all.keys())?
+        active_adc_profile(store, all.keys(), active_profile)?
     } else {
         None
     };
@@ -320,37 +493,204 @@ pub fn authenticate_only(
     Ok(())
 }
 
-/// The profile whose ADC is live: the stored credential whose refresh token equals the live
-/// ADC file's. `None` when the live file is missing, is not a user credential, or matches no
-/// profile.
-pub fn active_adc_profile<'a>(
-    store: &Store,
-    names: impl IntoIterator<Item = &'a String>,
-) -> Result<Option<String>> {
+/// The live ADC document, or `None` when there is no live file or it is not JSON.
+fn read_live_adc_if_any() -> Result<Option<Value>> {
     let live = live_adc_path()?;
     if !live.exists() {
         return Ok(None);
     }
     // The live file belongs to gcloud; if it is not an ADC document, no profile's ADC is live.
-    let live: Value = match serde_json::from_str(&fs::read_to_string(&live)?) {
-        Ok(value) => value,
-        Err(_) => return Ok(None),
-    };
-    let Some(live_token) = refresh_token(&live) else {
+    Ok(serde_json::from_str(&fs::read_to_string(&live)?).ok())
+}
+
+/// The profile whose ADC is live. Profiles that share one account also share one refresh
+/// token (an ADC derived from the user credential), so the candidates are the profiles whose
+/// stored credential equals the live file in refresh token AND quota project; among several,
+/// the active profile, else the first by name. Profiles that agree in both write the same
+/// live file, so the rest is a name. `None` when the live file is missing, is not a user
+/// credential, or matches no profile.
+pub fn active_adc_profile<'a>(
+    store: &Store,
+    names: impl IntoIterator<Item = &'a String>,
+    active_profile: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(live) = read_live_adc_if_any()? else {
         return Ok(None);
     };
+    let mut stored = Vec::new();
     for name in names {
-        if let Some(stored) = store.load_adc_json(name)? {
-            if refresh_token(&stored) == Some(live_token) {
-                return Ok(Some(name.clone()));
-            }
+        if let Some(adc) = store.load_adc_json(name)? {
+            stored.push((name.clone(), adc));
         }
     }
-    Ok(None)
+    Ok(match_adc_profile(&live, &stored, active_profile))
+}
+
+/// The matching rule of `active_adc_profile`, over the stored credentials in name order.
+fn match_adc_profile(
+    live: &Value,
+    stored: &[(String, Value)],
+    active_profile: Option<&str>,
+) -> Option<String> {
+    let live_token = refresh_token(live)?;
+    let live_quota = quota_project(live);
+    let matches =
+        |adc: &Value| refresh_token(adc) == Some(live_token) && quota_project(adc) == live_quota;
+    match active_profile {
+        Some(active) if stored.iter().any(|(name, adc)| name == active && matches(adc)) => {
+            Some(active.to_string())
+        }
+        _ => stored
+            .iter()
+            .find(|(_, adc)| matches(adc))
+            .map(|(name, _)| name.clone()),
+    }
 }
 
 fn refresh_token(adc: &Value) -> Option<&str> {
     adc_user_creds(adc)?.get("refresh_token")?.as_str()
+}
+
+fn quota_project(adc: &Value) -> Option<&str> {
+    adc.get("quota_project_id")?.as_str()
+}
+
+/// gcloud's active configuration as it is on disk: name, account and project (empty when
+/// unset), and the profile of that name with whether the configuration has drifted from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveConfiguration {
+    pub name: String,
+    pub account: String,
+    pub project: String,
+    /// The profile of the same name, when there is one.
+    pub profile: Option<String>,
+    /// The configuration's account or project is not what that profile says.
+    pub differs: bool,
+}
+
+/// The live ADC file as it is on disk: the account it records (empty when gcloud did not
+/// record one), its quota project, and the profile it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveAdc {
+    pub account: String,
+    pub quota_project: String,
+    pub profile: Option<String>,
+    /// The recorded account is not what that profile says.
+    pub differs: bool,
+}
+
+/// What gcloud holds right now, read from its files rather than from the profiles.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LiveState {
+    /// `None` when gcloud has no active configuration.
+    pub configuration: Option<LiveConfiguration>,
+    /// `None` when there is no live ADC file.
+    pub adc: Option<LiveAdc>,
+}
+
+impl LiveConfiguration {
+    /// "name · account · project p", for a status line.
+    pub fn describe(&self) -> String {
+        format!(
+            "{} \u{00b7} {} \u{00b7} {}",
+            self.name,
+            if self.account.is_empty() { "no account" } else { self.account.as_str() },
+            describe_project(&self.project)
+        )
+    }
+
+    /// What the profiles do not say about this configuration, if anything.
+    pub fn drift_note(&self) -> Option<String> {
+        match &self.profile {
+            Some(profile) if self.differs => Some(format!("differs from profile '{}'", profile)),
+            Some(_) => None,
+            None => Some("no profile".to_string()),
+        }
+    }
+}
+
+impl LiveAdc {
+    /// "profile · account · quota project q", for a status line.
+    pub fn describe(&self) -> String {
+        format!(
+            "{} \u{00b7} {} \u{00b7} {}",
+            self.profile.as_deref().unwrap_or("no profile"),
+            if self.account.is_empty() { "account not recorded" } else { self.account.as_str() },
+            describe_quota_project(&self.quota_project)
+        )
+    }
+
+    /// What the profile does not say about this credential, if anything.
+    pub fn drift_note(&self) -> Option<String> {
+        self.differs.then(|| "differs from the profile".to_string())
+    }
+}
+
+/// Read the live state from gcloud's files.
+pub fn live_state(
+    store: &Store,
+    profiles: &BTreeMap<String, Profile>,
+    active_profile: Option<&str>,
+) -> Result<LiveState> {
+    let configuration = match read_active_config()? {
+        Some(name) => {
+            let (account, project) = read_configuration(&name)?.unwrap_or_default();
+            let profile = profiles.get(&name);
+            let differs = profile
+                .map(|p| p.user_account != account || p.user_project != project)
+                .unwrap_or(false);
+            Some(LiveConfiguration {
+                profile: profile.map(|_| name.clone()),
+                name,
+                account,
+                project,
+                differs,
+            })
+        }
+        None => None,
+    };
+    let adc = match read_live_adc_if_any()? {
+        Some(live) => {
+            let account = live
+                .get("account")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let quota = quota_project(&live).unwrap_or_default().to_string();
+            let profile = active_adc_profile(store, profiles.keys(), active_profile)?;
+            let differs = profile
+                .as_ref()
+                .and_then(|name| profiles.get(name))
+                .map(|p| !account.is_empty() && p.adc_account != account)
+                .unwrap_or(false);
+            Some(LiveAdc {
+                account,
+                quota_project: quota,
+                profile,
+                differs,
+            })
+        }
+        None => None,
+    };
+    Ok(LiveState { configuration, adc })
+}
+
+/// Validity of the live user credential: the active configuration's account has a credential
+/// in gcloud that Google still accepts. `None` when there is no configuration or account.
+pub fn check_live_user_auth(state: &LiveState) -> Option<bool> {
+    let account = &state.configuration.as_ref()?.account;
+    if account.is_empty() {
+        return None;
+    }
+    Some(check_account_auth(account))
+}
+
+/// Validity of the live ADC credential. `None` when there is no live file.
+pub fn check_live_adc_auth(state: &LiveState) -> Result<Option<bool>> {
+    let Some(adc) = &state.adc else {
+        return Ok(None);
+    };
+    Ok(Some(check_adc_auth_at(live_adc_path()?, adc.account.clone())))
 }
 
 /// Whether an ADC document may serve `expected_account`. gcloud writes the `account` field
@@ -506,6 +846,33 @@ pub fn list_authenticated_accounts() -> Result<Vec<String>> {
     Ok(accounts)
 }
 
+/// The account and project a configuration file sets; empty when it does not set them.
+fn parse_configuration(content: &str) -> (String, String) {
+    let mut account = String::new();
+    let mut project = String::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(val) = line.strip_prefix("account = ") {
+            account = val.trim().to_string();
+        }
+        if let Some(val) = line.strip_prefix("project = ") {
+            project = val.trim().to_string();
+        }
+    }
+    (account, project)
+}
+
+/// The account and project of the configuration `name`, or `None` when it has no file.
+pub fn read_configuration(name: &str) -> Result<Option<(String, String)>> {
+    let path = configurations_dir()?.join(format!("config_{}", name));
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    Ok(Some(parse_configuration(&content)))
+}
+
 /// All gcloud configurations as (name, account, project); account and project are empty when
 /// the configuration does not set them.
 pub fn discover_existing_configs() -> Result<Vec<(String, String, String)>> {
@@ -520,17 +887,7 @@ pub fn discover_existing_configs() -> Result<Vec<(String, String, String)>> {
             let file_name = entry.file_name().to_string_lossy().to_string();
             if let Some(name) = file_name.strip_prefix("config_") {
                 if let Ok(content) = fs::read_to_string(entry.path()) {
-                    let mut account = String::new();
-                    let mut project = String::new();
-                    for line in content.lines() {
-                        let line = line.trim();
-                        if let Some(val) = line.strip_prefix("account = ") {
-                            account = val.trim().to_string();
-                        }
-                        if let Some(val) = line.strip_prefix("project = ") {
-                            project = val.trim().to_string();
-                        }
-                    }
+                    let (account, project) = parse_configuration(&content);
                     results.push((name.to_string(), account, project));
                 }
             }
@@ -595,6 +952,86 @@ mod tests {
         assert!(adc_account_matches(&same, "a@x.com"));
         let other = json!({"type": "authorized_user", "account": "b@x.com"});
         assert!(!adc_account_matches(&other, "a@x.com"));
+    }
+
+    fn profile(user_project: &str, adc_quota_project: &str) -> Profile {
+        Profile {
+            user_account: "a@x.com".into(),
+            user_project: user_project.into(),
+            adc_account: "a@x.com".into(),
+            adc_quota_project: adc_quota_project.into(),
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn activation_message_names_the_parts_and_their_projects() {
+        let full = profile("p", "q");
+        assert_eq!(
+            activation_message("x", &full, Parts::BOTH),
+            "Activated profile 'x': project p, ADC quota project q."
+        );
+        assert_eq!(
+            activation_message("x", &full, Parts::USER),
+            "Activated user configuration of 'x': project p."
+        );
+        assert_eq!(activation_message("x", &full, Parts::ADC), "Activated ADC of 'x': quota project q.");
+        let bare = profile("", "");
+        assert_eq!(
+            activation_message("x", &bare, Parts::BOTH),
+            "Activated profile 'x': no project, ADC no quota project."
+        );
+        assert_eq!(activation_message("x", &bare, Parts::ADC), "Activated ADC of 'x': no quota project.");
+    }
+
+    #[test]
+    fn live_adc_matches_on_token_and_quota_project_and_prefers_the_active_profile() {
+        let adc = |token: &str, quota: Option<&str>| match quota {
+            Some(q) => json!({"type": "authorized_user", "refresh_token": token, "quota_project_id": q}),
+            None => json!({"type": "authorized_user", "refresh_token": token}),
+        };
+        // Three profiles derived from one user login share the token; two share the quota project.
+        let stored = vec![
+            ("agentic".to_string(), adc("t", Some("p1"))),
+            ("eri".to_string(), adc("t", Some("p2"))),
+            ("gm".to_string(), adc("t", Some("p1"))),
+            ("other".to_string(), adc("u", Some("p1"))),
+        ];
+        let live = adc("t", Some("p1"));
+        assert_eq!(match_adc_profile(&live, &stored, None), Some("agentic".into()));
+        assert_eq!(match_adc_profile(&live, &stored, Some("gm")), Some("gm".into()));
+        // The active profile is only preferred among the candidates.
+        assert_eq!(match_adc_profile(&live, &stored, Some("eri")), Some("agentic".into()));
+        assert_eq!(match_adc_profile(&adc("t", Some("p2")), &stored, None), Some("eri".into()));
+        // A quota project set by hand to another value matches no profile; so does no token.
+        assert_eq!(match_adc_profile(&adc("t", Some("p3")), &stored, None), None);
+        assert_eq!(match_adc_profile(&adc("t", None), &stored, None), None);
+        assert_eq!(match_adc_profile(&json!({"type": "external_account"}), &stored, None), None);
+    }
+
+    #[test]
+    fn live_descriptions_and_drift_notes() {
+        let configuration = LiveConfiguration {
+            name: "mmt01".into(),
+            account: "a@x.com".into(),
+            project: "p".into(),
+            profile: Some("mmt01".into()),
+            differs: false,
+        };
+        assert_eq!(configuration.describe(), "mmt01 \u{00b7} a@x.com \u{00b7} project p");
+        assert_eq!(configuration.drift_note(), None);
+        let drifted = LiveConfiguration { differs: true, ..configuration.clone() };
+        assert_eq!(drifted.drift_note().as_deref(), Some("differs from profile 'mmt01'"));
+        let orphan = LiveConfiguration { profile: None, account: String::new(), project: String::new(), ..configuration };
+        assert_eq!(orphan.describe(), "mmt01 \u{00b7} no account \u{00b7} no project");
+        assert_eq!(orphan.drift_note().as_deref(), Some("no profile"));
+
+        let adc = LiveAdc { account: String::new(), quota_project: "q".into(), profile: None, differs: false };
+        assert_eq!(adc.describe(), "no profile \u{00b7} account not recorded \u{00b7} quota project q");
+        assert_eq!(adc.drift_note(), None);
+        let recorded = LiveAdc { account: "b@x.com".into(), profile: Some("p".into()), differs: true, ..adc };
+        assert_eq!(recorded.describe(), "p \u{00b7} b@x.com \u{00b7} quota project q");
+        assert_eq!(recorded.drift_note().as_deref(), Some("differs from the profile"));
     }
 
     #[test]

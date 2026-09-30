@@ -10,7 +10,11 @@ use ratatui::{
 };
 
 use crate::app::{App, Column, InputMode};
+use crate::gcloud::LiveState;
 use crate::profile::{Profile, SyncMode};
+
+/// Lines above the table that show what gcloud holds now: one per part.
+const LIVE_LINES: u16 = 2;
 
 /// The two-line header labels, one pair per column.
 const HEADER_LABELS: [(&str, &str); 3] = [
@@ -91,8 +95,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Calculate table content width
     let table_width = table_content_width(app);
 
-    // Minimum width: max of normal help and table, capped at terminal width
-    let content_width = (normal_help_width.max(table_width) as u16).min(frame_area.width);
+    let live_lines = build_live_lines(&app.live, app.live_user_valid, app.live_adc_valid);
+    let live_width = live_lines.iter().map(Line::width).max().unwrap_or(0);
+
+    // Minimum width: the widest of help, table and live lines, capped at terminal width
+    let content_width = (normal_help_width.max(table_width).max(live_width) as u16)
+        .min(frame_area.width);
 
     // Table height
     let table_h: u16 = if app.profile_names.is_empty() {
@@ -101,8 +109,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         2 + (app.profile_names.len() as u16) * 2
     };
 
-    // Total content height: table + status bar + help
-    let total_h = table_h + 2;
+    // Total content height: live lines + table + status bar + help
+    let total_h = LIVE_LINES + table_h + 2;
 
     // Center horizontally; center vertically if content fits
     let x = (frame_area.width.saturating_sub(content_width)) / 2;
@@ -121,16 +129,72 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     };
 
     let chunks = Layout::vertical([
+        Constraint::Length(LIVE_LINES),
         table_constraint,
         Constraint::Length(1),
         Constraint::Length(1),
     ])
     .split(centered);
 
-    draw_table(frame, app, chunks[0]);
-    draw_status_bar(frame, app, chunks[1]);
-    frame.render_widget(Paragraph::new(help_line), chunks[2]);
-    draw_suggestions(frame, app, chunks[0]);
+    frame.render_widget(Paragraph::new(live_lines.to_vec()), chunks[0]);
+    draw_table(frame, app, chunks[1]);
+    draw_status_bar(frame, app, chunks[2]);
+    frame.render_widget(Paragraph::new(help_line), chunks[3]);
+    draw_suggestions(frame, app, chunks[1]);
+}
+
+/// The auth-status suffix after a credential: a key when it is valid, a lock when it is not,
+/// nothing while unchecked.
+fn lock_glyph(valid: Option<bool>) -> &'static str {
+    match valid {
+        Some(true) => " \u{1F511}",
+        Some(false) => " \u{1F512}",
+        None => "",
+    }
+}
+
+/// One line per part: the label, what gcloud holds, any drift from the profiles, and the
+/// validity of that credential.
+fn build_live_lines(
+    live: &LiveState,
+    user_valid: Option<bool>,
+    adc_valid: Option<bool>,
+) -> [Line<'static>; 2] {
+    let label = |text: &str| {
+        Span::styled(
+            format!("{:<8}", text),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )
+    };
+    let line = |text: &str, value: Option<(String, Option<String>)>, valid: Option<bool>| {
+        let mut spans = vec![label(text)];
+        match value {
+            Some((description, note)) => {
+                spans.push(Span::raw(description));
+                if let Some(note) = note {
+                    spans.push(Span::styled(
+                        format!(" ({})", note),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
+                spans.push(Span::raw(lock_glyph(valid).to_string()));
+            }
+            None => spans.push(Span::styled("none", Style::default().fg(Color::DarkGray))),
+        }
+        Line::from(spans)
+    };
+    [
+        line(
+            "gcloud",
+            live.configuration.as_ref().map(|c| (c.describe(), c.drift_note())),
+            user_valid,
+        ),
+        line(
+            "ADC",
+            live.adc.as_ref().map(|a| (a.describe(), a.drift_note())),
+            adc_valid,
+        ),
+    ]
 }
 
 fn table_content_width(app: &App) -> usize {
@@ -180,24 +244,14 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
             let is_editing = i == app.selected_row
                 && matches!(app.input_mode, InputMode::EditAccount | InputMode::EditProject);
 
-            let user_auth_status = app.user_auth_valid.get(i).copied().flatten();
-            let user_lock = match user_auth_status {
-                Some(true) => " \u{1F511}",
-                Some(false) => " \u{1F512}",
-                None => "",
-            };
+            let user_lock = lock_glyph(app.user_auth_valid.get(i).copied().flatten());
             let user_info = if is_editing && app.edit_col == Column::User {
                 format!("{}\n{}", app.edit_account_buffer, app.edit_project_buffer)
             } else {
                 format!("{}{}\n{}", profile.user_account, user_lock, profile.user_project)
             };
 
-            let adc_auth_status = app.adc_auth_valid.get(i).copied().flatten();
-            let adc_lock = match adc_auth_status {
-                Some(true) => " \u{1F511}",
-                Some(false) => " \u{1F512}",
-                None => "",
-            };
+            let adc_lock = lock_glyph(app.adc_auth_valid.get(i).copied().flatten());
             let adc_info = if is_editing && app.edit_col == Column::Adc {
                 format!("{}\n{}", app.edit_account_buffer, app.edit_project_buffer)
             } else {
